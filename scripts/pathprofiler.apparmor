@@ -1,0 +1,44 @@
+#include <tunables/global>
+
+profile pathprofiler-daemon /opt/pathprofiler/pathprofiler-daemon flags=(attach_disconnected) {
+  #include <abstractions/base>
+  #include <abstractions/nameservice>
+
+  /etc/frr/ r,
+  /etc/frr/** r,
+  /etc/pathprofiler.yaml r,
+
+  /usr/bin/vtysh ix,
+
+  /etc/passwd r,
+  /etc/nsswitch.conf r,
+
+  /etc/pam.d/ r,
+  /etc/pam.d/** r,
+  /etc/security/ r,
+  /etc/security/** r,
+  /usr/lib/**/security/*.so mr,
+  /usr/lib/**/libpam*.so mr,
+
+  capability net_admin,
+  capability net_raw,
+  capability sys_admin,
+  capability bpf,
+  capability dac_override,
+
+  mount fstype=bpffs -> /sys/fs/bpf/,
+  mount fstype=bpffs -> /sys/fs/bpf/pathprofiler/,
+
+  /sys/fs/bpf/ r,
+  /sys/fs/bpf/pathprofiler/ rw,
+  /sys/fs/bpf/pathprofiler/** rwkl,
+
+  /sys/kernel/btf/vmlinux r,
+
+  /sys/fs/cgroup/ r,
+
+  /run/frr/ r,
+  /run/frr/** rw,
+
+  /root/.history_frr rw,
+}

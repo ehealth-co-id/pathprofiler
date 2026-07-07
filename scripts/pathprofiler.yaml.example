@@ -1,0 +1,17 @@
+# /etc/pathprofiler.yaml — pathprofiler daemon config
+# NOTE: as of this release the daemon does not yet read this file
+# (internal/config.Load is implemented but not wired into cmd/daemon/main.go).
+# Flags --poll / --min-dwell / --min-margin on ExecStart are what take effect.
+
+scope:
+  prefixes: []   # CIDRs to actuate on; empty = all RIB prefixes
+
+tiers:
+  local: 300     # best path local-pref
+  dedicated: 200 # 2nd-best
+  default: 100   # FRR default
+
+probe:
+  port: 33434
+  timeout_seconds: 2
+  interval_seconds: 60

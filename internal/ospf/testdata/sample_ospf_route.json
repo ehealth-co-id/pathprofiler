@@ -1,0 +1,77 @@
+{
+  "10.255.0.3/32": {
+    "routeType": "N",
+    "transit": false,
+    "cost": 60,
+    "area": "0.0.0.0",
+    "nexthops": [
+      {
+        "ip": "192.168.200.3",
+        "via": "wg0",
+        "advertisedRouter": "192.168.200.3"
+      }
+    ]
+  },
+  "10.255.0.4/32": {
+    "routeType": "N",
+    "transit": false,
+    "cost": 60,
+    "area": "0.0.0.0",
+    "nexthops": [
+      {
+        "ip": "192.168.200.4",
+        "via": "wg0",
+        "advertisedRouter": "192.168.200.4"
+      }
+    ]
+  },
+  "10.255.0.5/32": {
+    "routeType": "N",
+    "transit": false,
+    "cost": 10,
+    "area": "0.0.0.0",
+    "nexthops": [
+      {
+        "ip": " ",
+        "directlyAttachedTo": "Loopback0"
+      }
+    ]
+  },
+  "10.255.0.6/32": {
+    "routeType": "N",
+    "transit": false,
+    "cost": 20,
+    "area": "0.0.0.0",
+    "nexthops": [
+      {
+        "ip": "192.168.100.6",
+        "via": "ens21",
+        "advertisedRouter": "192.168.200.6"
+      }
+    ]
+  },
+  "192.168.100.0/24": {
+    "routeType": "N",
+    "transit": false,
+    "cost": 10,
+    "area": "0.0.0.0",
+    "nexthops": [
+      {
+        "ip": " ",
+        "directlyAttachedTo": "ens21"
+      }
+    ]
+  },
+  "192.168.200.0/24": {
+    "routeType": "N",
+    "transit": true,
+    "cost": 50,
+    "area": "0.0.0.0",
+    "nexthops": [
+      {
+        "ip": " ",
+        "directlyAttachedTo": "wg0"
+      }
+    ]
+  }
+}

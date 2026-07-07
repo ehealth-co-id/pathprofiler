@@ -1,0 +1,31 @@
+[Unit]
+Description=pathprofiler network path health daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/opt/pathprofiler/pathprofiler-daemon --config /etc/pathprofiler.yaml
+WorkingDirectory=/opt/pathprofiler
+
+# Daemon loads BPF programs at startup (sockops, tracepoint, XDP).
+# CAP_DAC_OVERRIDE: read FRR config (/etc/frr/*.conf, mode 600 owned by frr:frrvty)
+# without it, root under a restricted CapabilityBoundingSet can't bypass DAC.
+AmbientCapabilities=CAP_BPF CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_ADMIN CAP_DAC_OVERRIDE
+CapabilityBoundingSet=CAP_BPF CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_ADMIN CAP_DAC_OVERRIDE
+
+# Ensure bpffs is mounted for BPF map pinning.
+ExecStartPre=/bin/sh -c 'mountpoint -q /sys/fs/bpf || mount -t bpf bpf /sys/fs/bpf'
+
+Restart=always
+RestartSec=2
+TimeoutStartSec=10
+
+NoNewPrivileges=true
+PrivateTmp=true
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

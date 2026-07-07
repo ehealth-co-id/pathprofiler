@@ -1,0 +1,28 @@
+---
+description: Windows dev environment — PowerShell, Go toolchain
+alwaysApply: true
+---
+
+# Windows development environment
+
+This project is developed on **Windows**. Use **PowerShell 7** (`pwsh`) for all shell commands — not bash, not cmd, not Windows PowerShell 5.1.
+
+## Command chaining
+
+PowerShell 7 supports `&&`, `||`, and `;`:
+
+```powershell
+cd "c:\Users\ibroh\Project\pathprofiler" && .\gradlew :composeApp:test
+```
+
+Use `&&` when the next command should run only if the previous one succeeded. Use `;` for unconditional chaining. Do not use bash-only syntax (`export`, bash-style `$(...)` subshells, HEREDOC `cat << 'EOF'`/`EOF`).
+Do not use Unix tools that don't exist in PowerShell. Never pipe to `head`, `tail`, `sed`, or `awk`. Use `Select-Object -First N` / `-Last N` instead of `head`/`tail`, use the Read/StrReplace/Write tools instead of `sed`/`awk` for file editing, and use `rg` (ripgrep) instead of `grep`.
+
+## Go toolchain
+
+The Go toolchain is installed at `C:\Program Files\go\bin`.
+
+- When running Go commands (e.g., `go build`, `go test`, `go mod tidy`, etc.), ensure `C:\Program Files\go\bin` is in the PATH, or invoke the Go binary directly via its full path.
+- Example: `& "C:\Program Files\go\bin\go.exe" build .`
+
+Use Windows path separators (`\`) and PowerShell syntax (`$env:VAR`, not `export VAR=`).

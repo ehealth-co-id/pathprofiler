@@ -1,0 +1,138 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build (${{ matrix.goarch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86
+            goarch: amd64
+            vmlinux_arch: x86
+          - arch: arm64
+            goarch: arm64
+            vmlinux_arch: aarch64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install BPF build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang llvm libelf-dev libbpf-dev linux-libc-dev
+          sudo ln -sf /usr/include/$(uname -m)-linux-gnu/asm /usr/include/asm
+
+      - name: Fetch vmlinux.h for ${{ matrix.vmlinux_arch }}
+        # BPF programs are CO-RE (Compile Once, Run Everywhere): a vmlinux.h
+        # built from any BTF-enabled kernel works on any other BTF-enabled
+        # kernel. We use libbpf/vmlinux.h instead of bpftool because the
+        # GitHub runners' -azure kernel flavor has no matching linux-tools
+        # package, so `bpftool btf dump` fails there.
+        run: |
+          git clone --depth 1 https://github.com/libbpf/vmlinux.h.git /tmp/vmlinux.h
+          cp /tmp/vmlinux.h/include/${{ matrix.vmlinux_arch }}/vmlinux.h bpf/vmlinux.h
+          echo "Fetched vmlinux.h for ${{ matrix.vmlinux_arch }} ($(wc -l < bpf/vmlinux.h) lines)"
+
+      - name: Build BPF objects
+        run: make TARGET_ARCH=${{ matrix.arch }} bpf
+
+      - name: Copy BPF objects for go:embed
+        run: |
+          mkdir -p internal/loader
+          cp bpf/*.bpf.o internal/loader/
+
+      - name: Build daemon
+        run: |
+          mkdir -p bin
+          GOOS=linux GOARCH=${{ matrix.goarch }} go build -trimpath -ldflags="-s -w" -o bin/pathprofiler-daemon-linux-${{ matrix.goarch }} ./cmd/daemon
+
+      - name: Verify binary
+        run: file bin/pathprofiler-daemon-linux-${{ matrix.goarch }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pathprofiler-daemon-linux-${{ matrix.goarch }}
+          path: bin/pathprofiler-daemon-linux-${{ matrix.goarch }}
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: assets
+          merge-multiple: true
+
+      - name: Create checksums
+        working-directory: assets
+        run: sha256sum pathprofiler-daemon-linux-* | tee SHA256SUMS
+
+      - name: Prepare release body
+        env:
+          REF_NAME: ${{ github.ref_name }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          {
+            printf '# pathprofiler %s\n\n' "$REF_NAME"
+            printf 'Pre-built `pathprofiler-daemon` binaries for Linux.\n\n'
+            printf '## Available binaries\n\n'
+            printf -- '- `pathprofiler-daemon-linux-amd64` -- x86_64\n'
+            printf -- '- `pathprofiler-daemon-linux-arm64` -- aarch64\n\n'
+            printf '## Requirements\n\n'
+            printf -- '- Linux kernel 5.10+ with BTF enabled (CO-RE)\n'
+            printf -- '- Root privileges (for BPF map access and route actuation)\n'
+            printf -- '- FRR 8.x (optional -- only for BGP actuation)\n\n'
+            printf '## Quick install (one-liner)\n\n'
+            printf '```bash\n'
+            printf '# Specific version\n'
+            printf 'bash <(curl -fsSL https://github.com/%s/releases/download/%s/install.sh) --version %s\n' "$REPOSITORY" "$REF_NAME" "$REF_NAME"
+            printf '```\n\n'
+            printf '## Manual install\n\n'
+            printf '```bash\n'
+            printf '# Download\n'
+            printf 'wget https://github.com/%s/releases/download/%s/pathprofiler-daemon-linux-amd64\n' "$REPOSITORY" "$REF_NAME"
+            printf 'chmod +x pathprofiler-daemon-linux-amd64\n\n'
+            printf '# Install\n'
+            printf 'sudo install -m 0755 pathprofiler-daemon-linux-amd64 /opt/pathprofiler/pathprofiler-daemon\n'
+            printf 'sudo install -m 0644 scripts/pathprofiler.service /etc/systemd/system/pathprofiler.service\n'
+            printf 'sudo install -m 0644 scripts/pathprofiler.apparmor /etc/apparmor.d/opt.pathprofiler.pathprofiler-daemon\n'
+            printf 'sudo apparmor_parser -r /etc/apparmor.d/opt.pathprofiler.pathprofiler-daemon\n'
+            printf 'sudo systemctl daemon-reload\n'
+            printf 'sudo systemctl enable --now pathprofiler\n'
+            printf '```\n\n'
+            printf '## Checksums\n\n'
+            printf '```\n'
+            cat assets/SHA256SUMS
+            printf '```\n'
+          } > release_body.md
+
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            assets/pathprofiler-daemon-linux-amd64
+            assets/pathprofiler-daemon-linux-arm64
+            assets/SHA256SUMS
+            scripts/install.sh
+            scripts/pathprofiler.service
+            scripts/pathprofiler.apparmor
+            scripts/pathprofiler.yaml.example
+          body_path: release_body.md
