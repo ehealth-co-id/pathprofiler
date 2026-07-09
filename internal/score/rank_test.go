@@ -117,8 +117,10 @@ func TestRankByTier_SinglePath_EmitsDefault(t *testing.T) {
 }
 
 func TestRankByTier_LowConfidenceBest(t *testing.T) {
-	// Best path has low confidence -> gets defaultTier, not topTier.
-	// 2nd path has high confidence -> gets midTier (not promoted to top).
+	// Tier-inversion trip-wire: when the best path is low-confidence and
+	// the 2nd-best is high-confidence passive (not a tainted cold probe),
+	// NOT receive a higher local-pref than the best. BGP picks highest
+	// local-pref, so 100 < 200 would steer traffic onto the worse path.
 	const (
 		topTier = 300
 		midTier = 200
@@ -142,8 +144,60 @@ func TestRankByTier_LowConfidenceBest(t *testing.T) {
 	if lookup["10.0.0.1"] != defTier {
 		t.Errorf("low-confidence best should get defaultTier %d, got %d", defTier, lookup["10.0.0.1"])
 	}
-	if lookup["10.0.0.2"] != midTier {
-		t.Errorf("2nd-best should get midTier %d, got %d", midTier, lookup["10.0.0.2"])
+	// Invariant: 2nd-best tier must be <= best's tier. With best demoted to
+	// defaultTier, the 2nd-best is capped at defaultTier too -- it cannot
+	// be promoted to midTier over a demoted best.
+	if lookup["10.0.0.2"] > lookup["10.0.0.1"] {
+		t.Errorf("tier inversion: 2nd-best (%d) outranks best (%d) -- monotonicity violated",
+			lookup["10.0.0.2"], lookup["10.0.0.1"])
+	}
+	if lookup["10.0.0.2"] != defTier {
+		t.Errorf("2nd-best should be capped at defaultTier %d when best is demoted, got %d",
+			defTier, lookup["10.0.0.2"])
+	}
+}
+
+func TestRankByTier_ColdProbeRegression_NoInversionAtDeployTime(t *testing.T) {
+	// Regression for the deploy outage: fresh BPF maps -> every real path
+	// low-confidence (srttSamples<5); cold probes carry Confidence=0 (taint).
+	// The true best path (low RTT, low confidence) ranks i==0, demoted to
+	// defaultTier. The cold-probed alternate (worse RTT, tainted) ranks i==1
+	// and must NOT jump to midTier over the demoted best.
+	const (
+		topTier = 300
+		midTier = 200
+		defTier = 100
+		prefix  = "10.0.0.0/8"
+	)
+	paths := []PathCost{
+		// True best: fast path, but only a couple passive samples -> low conf.
+		{NextHopIP: 1, Neighbor: "10.0.0.1", EgressRTTUs: 800, Confidence: 0.2},
+		// Cold-probed alternate: worse path, underlay-only taint -> conf 0.
+		{NextHopIP: 2, Neighbor: "10.0.0.2", EgressRTTUs: 5000, Confidence: 0},
+	}
+	for i := range paths {
+		paths[i].Composite = composite(paths[i], DefaultWeights)
+	}
+
+	updates := RankByTier(paths, prefix, topTier, midTier, defTier)
+	if len(updates) != 2 {
+		t.Fatalf("expected 2 updates, got %d", len(updates))
+	}
+	lookup := make(map[string]int)
+	for _, u := range updates {
+		lookup[u.Neighbor] = u.Prefs[0].LocalPref
+	}
+
+	best, second := lookup["10.0.0.1"], lookup["10.0.0.2"]
+	if second > best {
+		t.Fatalf("deploy-time tier inversion: best=%d, 2nd=%d -- cold probe outranks true best",
+			best, second)
+	}
+	if best != defTier {
+		t.Errorf("low-confidence best should be defaultTier %d, got %d", defTier, best)
+	}
+	if second != defTier {
+		t.Errorf("cold-probe 2nd should be capped at defaultTier %d, got %d", defTier, second)
 	}
 }
 
@@ -334,6 +388,94 @@ func TestCollapseByNeighbor_RecomputesComposite(t *testing.T) {
 	}
 }
 
+func TestCollapseByNeighbor_DropsColdWhenPassiveExists(t *testing.T) {
+	// Mixed-legs neighbor: passive end-to-end RTT + cold underlay RTT under
+	// same Neighbor. Collapse must use passive only — no scale dilution.
+	passive := PathCost{
+		NextHopIP:       1,
+		Neighbor:        "10.0.0.1",
+		EgressRTTUs:     8000,
+		EgressLossRate:  0.01,
+		IngressJitterUs: 200,
+		IngressGapRate:  0.005,
+		Confidence:      0.8,
+	}
+	cold := PathCost{
+		NextHopIP:   2,
+		Neighbor:    "10.0.0.1",
+		EgressRTTUs: 500, // underlay-only, would dilute passive if averaged
+		Confidence:  0,
+	}
+	passive.Composite = composite(passive, DefaultWeights)
+	cold.Composite = composite(cold, DefaultWeights)
+
+	collapsed := CollapseByNeighbor([]PathCost{passive, cold})
+	if len(collapsed) != 1 {
+		t.Fatalf("expected 1 collapsed path, got %d", len(collapsed))
+	}
+	c := collapsed[0]
+
+	if c.EgressRTTUs != passive.EgressRTTUs {
+		t.Errorf("EgressRTTUs: want passive-only %f, got %f", passive.EgressRTTUs, c.EgressRTTUs)
+	}
+	if c.Confidence != passive.Confidence {
+		t.Errorf("Confidence: want passive-only %f, got %f", passive.Confidence, c.Confidence)
+	}
+	if c.Composite != passive.Composite {
+		t.Errorf("Composite: want passive-only %f, got %f", passive.Composite, c.Composite)
+	}
+}
+
+func TestCollapseByNeighbor_KeepsColdWhenNoPassive(t *testing.T) {
+	// Cold-only neighbor: two tainted legs averaged; RankByTier demotes via
+	// Confidence < 0.5 -> defaultTier (self-check for taint + demotion chain).
+	cold1 := PathCost{
+		NextHopIP: 1, Neighbor: "10.0.0.1",
+		EgressRTTUs: 500, Confidence: 0,
+	}
+	cold2 := PathCost{
+		NextHopIP: 2, Neighbor: "10.0.0.1",
+		EgressRTTUs: 700, Confidence: 0,
+	}
+	cold1.Composite = composite(cold1, DefaultWeights)
+	cold2.Composite = composite(cold2, DefaultWeights)
+
+	collapsed := CollapseByNeighbor([]PathCost{cold1, cold2})
+	if len(collapsed) != 1 {
+		t.Fatalf("expected 1 collapsed path, got %d", len(collapsed))
+	}
+	c := collapsed[0]
+
+	if c.EgressRTTUs != 600 {
+		t.Errorf("EgressRTTUs: want averaged 600, got %f", c.EgressRTTUs)
+	}
+	if c.Confidence != 0 {
+		t.Errorf("Confidence: want 0, got %f", c.Confidence)
+	}
+
+	const (
+		topTier = 300
+		midTier = 200
+		defTier = 100
+		prefix  = "10.0.0.0/8"
+	)
+	// Add a high-confidence passive neighbor so cold-only gets ranked 2nd.
+	passive := PathCost{
+		NextHopIP: 3, Neighbor: "10.0.0.2",
+		EgressRTTUs: 1000, Confidence: 1.0,
+	}
+	passive.Composite = composite(passive, DefaultWeights)
+
+	updates := RankByTier([]PathCost{passive, c}, prefix, topTier, midTier, defTier)
+	lookup := make(map[string]int)
+	for _, u := range updates {
+		lookup[u.Neighbor] = u.Prefs[0].LocalPref
+	}
+	if lookup["10.0.0.1"] != defTier {
+		t.Errorf("cold-only neighbor should get defaultTier %d, got %d", defTier, lookup["10.0.0.1"])
+	}
+}
+
 // ---------------------------------------------------------------------------
 // FromProbeResult + golden equivalence tests (Finding 3)
 // ---------------------------------------------------------------------------
@@ -347,8 +489,8 @@ func TestFromProbeResult_Lost(t *testing.T) {
 	if pc.EgressRTTUs != 0 {
 		t.Errorf("EgressRTTUs: want 0, got %f", pc.EgressRTTUs)
 	}
-	if pc.Confidence != 1.0 {
-		t.Errorf("Confidence: want 1.0, got %f", pc.Confidence)
+	if pc.Confidence != 0 {
+		t.Errorf("Confidence: want 0 (cold-probe taint), got %f", pc.Confidence)
 	}
 	if pc.NextHopIP != 100 {
 		t.Errorf("NextHopIP: want 100, got %d", pc.NextHopIP)
@@ -370,8 +512,8 @@ func TestFromProbeResult_WithRTT(t *testing.T) {
 	if pc.EgressLossRate != 0 {
 		t.Errorf("EgressLossRate: want 0, got %f", pc.EgressLossRate)
 	}
-	if pc.Confidence != 1.0 {
-		t.Errorf("Confidence: want 1.0, got %f", pc.Confidence)
+	if pc.Confidence != 0 {
+		t.Errorf("Confidence: want 0 (cold-probe taint), got %f", pc.Confidence)
 	}
 
 	// Composite = 1.0 * 5000 (RTT term only).

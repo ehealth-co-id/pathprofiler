@@ -51,13 +51,35 @@ func CollapseByNeighbor(paths []PathCost) []PathCost {
 	result := make([]PathCost, 0, len(order))
 	for _, nb := range order {
 		g := byNeighbor[nb]
-		if g.n == 1 {
-			result = append(result, g.paths[0])
+		paths := g.paths
+
+		// ponytail: cold probe and passive path under same neighbor are different
+		// legs (F1 gate in main.go); if that gate weakens, this skip hides a
+		// genuinely complementary measurement.
+		hasUntainted := false
+		for _, p := range paths {
+			if p.Confidence > 0 {
+				hasUntainted = true
+				break
+			}
+		}
+		if hasUntainted {
+			filtered := make([]PathCost, 0, len(paths))
+			for _, p := range paths {
+				if p.Confidence > 0 {
+					filtered = append(filtered, p)
+				}
+			}
+			paths = filtered
+		}
+
+		if len(paths) == 1 {
+			result = append(result, paths[0])
 			continue
 		}
 
 		var rtt, loss, jitter, gap, conf float64
-		for _, p := range g.paths {
+		for _, p := range paths {
 			rtt += p.EgressRTTUs
 			loss += p.EgressLossRate
 			jitter += p.IngressJitterUs
@@ -66,7 +88,7 @@ func CollapseByNeighbor(paths []PathCost) []PathCost {
 				conf = p.Confidence
 			}
 		}
-		n := float64(g.n)
+		n := float64(len(paths))
 		collapsed := PathCost{
 			Neighbor:        nb,
 			EgressRTTUs:     rtt / n,
@@ -158,27 +180,40 @@ func RankByTier(paths []PathCost, prefix string,
 			pref:     actuate.PrefixPref{Prefix: prefix, LocalPref: defaultTier},
 		})
 	} else {
+		// Monotonicity: a worse-ranked path must never receive a higher
+		// local-pref than a better-ranked one. BGP picks the highest
+		// local-pref, so without this invariant a low-confidence best path
+		// demoted to defaultTier (100) would lose to a 2nd-best cold
+		// probe promoted to midTier (200) -- tier inversion. We compute
+		// the tier each rank would get, then clamp it to <= the tier
+		// actually assigned to the rank above. If the best is demoted,
+		// every subsequent path is capped at defaultTier too.
+		prevTier := topTier // ranks can only go down from here
 		for i, p := range filtered {
-			var tier int
+			var tierByRank int
 			switch {
 			case i == 0:
 				if p.Confidence >= 0.5 {
-					tier = topTier
+					tierByRank = topTier
 				} else {
-					tier = defaultTier
+					tierByRank = defaultTier
 				}
 			case i == 1:
 				if p.Confidence >= 0.5 {
-					tier = midTier
+					tierByRank = midTier
 				} else {
-					tier = defaultTier
+					tierByRank = defaultTier
 				}
 			default:
-				tier = defaultTier
+				tierByRank = defaultTier
 			}
+			if tierByRank > prevTier {
+				tierByRank = prevTier
+			}
+			prevTier = tierByRank
 			tieredPaths = append(tieredPaths, tiered{
 				neighbor: p.Neighbor,
-				pref:     actuate.PrefixPref{Prefix: prefix, LocalPref: tier},
+				pref:     actuate.PrefixPref{Prefix: prefix, LocalPref: tierByRank},
 			})
 		}
 	}

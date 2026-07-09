@@ -116,34 +116,16 @@ func composite(pc PathCost, w Weights) float64 {
 		w.IngressGap*pc.IngressGapRate
 }
 
-// ShouldSwitch applies hysteresis: the challenger must beat the incumbent
-// by a margin, sustained, before we actuate. minMarginPct and the caller's
-// dwell-time tracking together implement the dampening the original plan
-// left implicit.
-func ShouldSwitch(incumbent, challenger PathCost, minMarginPct float64) bool {
-	if challenger.Confidence < 0.5 {
-		return false // don't switch based on a path we barely have data on
-	}
-	if incumbent.Composite <= 0 {
-		return challenger.Composite < incumbent.Composite
-	}
-	improvement := (incumbent.Composite - challenger.Composite) / incumbent.Composite
-	return improvement > minMarginPct
-}
-
 // FromProbeResult builds a PathCost from a single cold-path probe.
-// RTT -> EgressRTTUs; Lost -> sentinel EgressLossRate 1.0; ingress fields zero;
-// Confidence = 1.0 (deterministic single sample, not a low-confidence passive
-// observation) so ShouldSwitch's guard (score.go line 107) doesn't reject it.
+// RTT -> EgressRTTUs (underlay-only, not end-to-end); Lost -> sentinel
+// EgressLossRate 1.0; ingress fields zero; Confidence = 0 (cold-probe taint).
 //
-// CARRY-FORWARD NOTE: Confidence=1.0 for a single lost probe is a deliberate
-// decision inherited from the master plan (Phase 6 section, line 78). A single
-// sample is definitionally low-confidence, but the Confidence field guards
-// ShouldSwitch (low-sample passive paths), not cold probes which are
-// deterministic by construction (one probe = one RTT). If cold-probe noise
-// becomes a problem, revisit here -- not in ShouldSwitch. (Finding 4 footnote.)
+// Confidence=0 marks the entry as underlay-scale so (a) RankByTier demotes
+// cold-only neighbors via the existing Confidence < 0.5 -> defaultTier rule,
+// and (b) CollapseByNeighbor drops it when a passive path for the same
+// neighbor exists, avoiding RTT scale mismatch in the averaged metric.
 func FromProbeResult(nextHop uint32, rtt time.Duration, lost bool) PathCost {
-	pc := PathCost{NextHopIP: nextHop, Confidence: 1.0}
+	pc := PathCost{NextHopIP: nextHop, Confidence: 0}
 	if lost {
 		pc.EgressLossRate = 1.0
 		pc.Composite = lostProbeComposite // sentinel: always worse than any measured path
