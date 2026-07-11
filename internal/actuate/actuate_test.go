@@ -49,11 +49,12 @@ func TestSetNeighborTiers_Script(t *testing.T) {
 		t.Fatalf("SetNeighborTiers: %v", err)
 	}
 
-	// Prefix-lists present.
-	if !strings.Contains(captured, "ip prefix-list PATHPROFILER-SCOPE-192-168-5-0-24 permit 192.168.5.0/24") {
+	// Prefix-lists present, with a fixed seq so repeated declarations
+	// across neighbors/ticks don't pile up duplicate entries.
+	if !strings.Contains(captured, "ip prefix-list PATHPROFILER-SCOPE-192-168-5-0-24 seq 5 permit 192.168.5.0/24") {
 		t.Errorf("missing prefix-list for 192.168.5.0/24\ngot:\n%s", captured)
 	}
-	if !strings.Contains(captured, "ip prefix-list PATHPROFILER-SCOPE-192-168-6-0-24 permit 192.168.6.0/24") {
+	if !strings.Contains(captured, "ip prefix-list PATHPROFILER-SCOPE-192-168-6-0-24 seq 5 permit 192.168.6.0/24") {
 		t.Errorf("missing prefix-list for 192.168.6.0/24\ngot:\n%s", captured)
 	}
 
@@ -185,6 +186,12 @@ func TestRemoveNeighborTiers_Script(t *testing.T) {
 		t.Fatalf("RemoveNeighborTiers: %v", err)
 	}
 
+	// Must detach route-map from neighbor inside `router bgp` context —
+	// `no neighbor ... route-map ... in` is invalid at the top level of
+	// configure terminal and vtysh exits 1 on it.
+	if !strings.Contains(captured, "router bgp\n") {
+		t.Errorf("missing `router bgp` context before `no neighbor ... route-map`\ngot:\n%s", captured)
+	}
 	// Must detach route-map from neighbor.
 	if !strings.Contains(captured, "no neighbor 192.168.100.6 route-map PATHPROFILER-192-168-100-6 in") {
 		t.Errorf("missing `no neighbor ... route-map ... in`\ngot:\n%s", captured)

@@ -1,0 +1,21 @@
+[Unit]
+Description=pathprofiler cold-probe UDP echo responder (no BPF/FRR access)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/opt/pathprofiler/pathprofiler-responder --port 33434
+DynamicUser=yes
+NoNewPrivileges=true
+ProtectSystem=strict
+PrivateTmp=true
+
+Restart=always
+RestartSec=2
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

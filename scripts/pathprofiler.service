@@ -8,7 +8,7 @@ Type=simple
 ExecStart=/opt/pathprofiler/pathprofiler-daemon --config /etc/pathprofiler.yaml
 WorkingDirectory=/opt/pathprofiler
 
-# Daemon loads BPF programs at startup (sockops, tracepoint, XDP).
+# Daemon loads BPF programs at startup (TC egress, XDP).
 # CAP_DAC_OVERRIDE: read FRR config (/etc/frr/*.conf, mode 600 owned by frr:frrvty)
 # without it, root under a restricted CapabilityBoundingSet can't bypass DAC.
 AmbientCapabilities=CAP_BPF CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_ADMIN CAP_DAC_OVERRIDE

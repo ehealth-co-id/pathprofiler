@@ -60,13 +60,25 @@ jobs:
           mkdir -p bin
           GOOS=linux GOARCH=${{ matrix.goarch }} go build -trimpath -ldflags="-s -w" -o bin/pathprofiler-daemon-linux-${{ matrix.goarch }} ./cmd/daemon
 
-      - name: Verify binary
-        run: file bin/pathprofiler-daemon-linux-${{ matrix.goarch }}
+      - name: Build responder
+        # Standalone binary -- no BPF dependency, builds with plain go build.
+        run: GOOS=linux GOARCH=${{ matrix.goarch }} go build -trimpath -ldflags="-s -w" -o bin/pathprofiler-responder-linux-${{ matrix.goarch }} ./cmd/responder
+
+      - name: Verify binaries
+        run: |
+          file bin/pathprofiler-daemon-linux-${{ matrix.goarch }}
+          file bin/pathprofiler-responder-linux-${{ matrix.goarch }}
 
       - uses: actions/upload-artifact@v4
         with:
           name: pathprofiler-daemon-linux-${{ matrix.goarch }}
           path: bin/pathprofiler-daemon-linux-${{ matrix.goarch }}
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pathprofiler-responder-linux-${{ matrix.goarch }}
+          path: bin/pathprofiler-responder-linux-${{ matrix.goarch }}
           if-no-files-found: error
 
   release:
@@ -83,7 +95,7 @@ jobs:
 
       - name: Create checksums
         working-directory: assets
-        run: sha256sum pathprofiler-daemon-linux-* | tee SHA256SUMS
+        run: sha256sum pathprofiler-daemon-linux-* pathprofiler-responder-linux-* | tee SHA256SUMS
 
       - name: Prepare release body
         env:
@@ -92,18 +104,23 @@ jobs:
         run: |
           {
             printf '# pathprofiler %s\n\n' "$REF_NAME"
-            printf 'Pre-built `pathprofiler-daemon` binaries for Linux.\n\n'
+            printf 'Pre-built `pathprofiler-daemon` and `pathprofiler-responder` binaries for Linux.\n\n'
             printf '## Available binaries\n\n'
-            printf -- '- `pathprofiler-daemon-linux-amd64` -- x86_64\n'
-            printf -- '- `pathprofiler-daemon-linux-arm64` -- aarch64\n\n'
+            printf -- '- `pathprofiler-daemon-linux-amd64` / `-arm64` -- the full path-health daemon (BPF + FRR)\n'
+            printf -- '- `pathprofiler-responder-linux-amd64` / `-arm64` -- standalone cold-probe UDP echo responder (no BPF, no root capabilities, no FRR)\n\n'
             printf '## Requirements\n\n'
+            printf '### `pathprofiler-daemon`\n\n'
             printf -- '- Linux kernel 5.10+ with BTF enabled (CO-RE)\n'
             printf -- '- Root privileges (for BPF map access and route actuation)\n'
             printf -- '- FRR 8.x (optional -- only for BGP actuation)\n\n'
+            printf '### `pathprofiler-responder`\n\n'
+            printf -- '- Any Linux kernel; runs unprivileged\n\n'
             printf '## Quick install (one-liner)\n\n'
             printf '```bash\n'
-            printf '# Specific version\n'
-            printf 'bash <(curl -fsSL https://github.com/%s/releases/download/%s/install.sh) --version %s\n' "$REPOSITORY" "$REF_NAME" "$REF_NAME"
+            printf '# Full daemon\n'
+            printf 'bash <(curl -fsSL https://github.com/%s/releases/download/%s/install.sh) --version %s\n\n' "$REPOSITORY" "$REF_NAME" "$REF_NAME"
+            printf '# Cold-probe responder only\n'
+            printf 'bash <(curl -fsSL https://github.com/%s/releases/download/%s/install-cold-probe-responder.sh) --version %s\n' "$REPOSITORY" "$REF_NAME" "$REF_NAME"
             printf '```\n\n'
             printf '## Manual install\n\n'
             printf '```bash\n'
@@ -130,8 +147,12 @@ jobs:
           files: |
             assets/pathprofiler-daemon-linux-amd64
             assets/pathprofiler-daemon-linux-arm64
+            assets/pathprofiler-responder-linux-amd64
+            assets/pathprofiler-responder-linux-arm64
             assets/SHA256SUMS
             scripts/install.sh
+            scripts/install-cold-probe-responder.sh
+            scripts/pathprofiler-responder.service
             scripts/pathprofiler.service
             scripts/pathprofiler.apparmor
             scripts/pathprofiler.yaml.example

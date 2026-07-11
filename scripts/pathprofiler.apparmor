@@ -10,6 +10,13 @@ profile pathprofiler-daemon /opt/pathprofiler/pathprofiler-daemon flags=(attach_
 
   /usr/bin/vtysh ix,
 
+  # ip route get for dst_to_nexthop population and device resolution.
+  # ip lives at /usr/sbin/ip -> /bin/ip on Debian/Ubuntu.
+  /bin/ip ix,
+  /sbin/ip ix,
+  /usr/bin/ip ix,
+  /usr/sbin/ip ix,
+
   /etc/passwd r,
   /etc/nsswitch.conf r,
 
@@ -35,10 +42,14 @@ profile pathprofiler-daemon /opt/pathprofiler/pathprofiler-daemon flags=(attach_
 
   /sys/kernel/btf/vmlinux r,
 
-  /sys/fs/cgroup/ r,
-
   /run/frr/ r,
   /run/frr/** rw,
 
+  # vtysh writes command history atomically: creates <file>.tmp then renames
+  # over <file>. The .tmp form needs create+write+unlink; the final form needs
+  # rw (read+write; rename target). Allow both literal and per-pid temp forms.
+  # ponytail: no `c` (create) mode — it is not a valid AppArmor mode token
+  # on this parser; create is granted implicitly by `w`.
   /root/.history_frr rw,
+  /root/.history_frr-*.tmp rwkl,
 }

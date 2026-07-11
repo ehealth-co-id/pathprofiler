@@ -12,7 +12,7 @@ func TestCleanPinDir_RemovesFilesLeavesDirs(t *testing.T) {
 	dir := t.TempDir()
 
 	// Simulate pinned objects as plain files.
-	if err := os.WriteFile(filepath.Join(dir, "egress_map"), []byte("x"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "transit_loss_map"), []byte("x"), 0o600); err != nil {
 		t.Fatalf("write file: %v", err)
 	}
 	// Simulate unexpected subdir; we should not recurse.
@@ -24,7 +24,7 @@ func TestCleanPinDir_RemovesFilesLeavesDirs(t *testing.T) {
 		t.Fatalf("cleanPinDir: %v", err)
 	}
 
-	if _, err := os.Stat(filepath.Join(dir, "egress_map")); err == nil {
+	if _, err := os.Stat(filepath.Join(dir, "transit_loss_map")); err == nil {
 		t.Fatalf("expected file to be removed")
 	} else if !os.IsNotExist(err) {
 		t.Fatalf("stat file: %v", err)

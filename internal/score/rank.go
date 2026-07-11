@@ -1,6 +1,7 @@
 package score
 
 import (
+	"math"
 	"sort"
 
 	"pathprofiler/internal/actuate"
@@ -78,12 +79,13 @@ func CollapseByNeighbor(paths []PathCost) []PathCost {
 			continue
 		}
 
-		var rtt, loss, jitter, gap, conf float64
+		var rtt, loss, jitter, gap, conf, sumSqErr float64
 		for _, p := range paths {
 			rtt += p.EgressRTTUs
 			loss += p.EgressLossRate
 			jitter += p.IngressJitterUs
 			gap += p.IngressGapRate
+			sumSqErr += p.CompositeErr * p.CompositeErr
 			if p.Confidence > conf {
 				conf = p.Confidence
 			}
@@ -95,6 +97,7 @@ func CollapseByNeighbor(paths []PathCost) []PathCost {
 			EgressLossRate:  loss / n,
 			IngressJitterUs: jitter / n,
 			IngressGapRate:  gap / n,
+			CompositeErr:    math.Sqrt(sumSqErr) / n, // quadrature: sqrt(Σerr²)/n preserves ~1/√M shrinkage
 			Confidence:      conf,
 		}
 		collapsed.Composite = composite(collapsed, DefaultWeights)
@@ -207,6 +210,19 @@ func RankByTier(paths []PathCost, prefix string,
 			default:
 				tierByRank = defaultTier
 			}
+
+			// Error-band gating: if this path's composite interval overlaps
+			// the better-ranked neighbor's, they are indistinguishable within
+			// measurement uncertainty. Cap this path's tier at the neighbor's.
+			if i > 0 {
+				prev := filtered[i-1]
+				if compositeIntervalsOverlap(prev, p) {
+					if tierByRank > prevTier {
+						tierByRank = prevTier
+					}
+				}
+			}
+
 			if tierByRank > prevTier {
 				tierByRank = prevTier
 			}
@@ -262,4 +278,18 @@ func GroupByNeighbor(perPrefix [][]actuate.NeighborTierUpdate) []actuate.Neighbo
 		})
 	}
 	return result
+}
+
+// compositeIntervalsOverlap returns true when two paths' composite error
+// bands intersect, meaning they are indistinguishable within measurement
+// uncertainty. Only gates when both paths carry non-zero uncertainty
+// (cold-probe data); passive paths with CompositeErr==0 are treated as
+// point measurements and never appear to overlap with each other.
+func compositeIntervalsOverlap(a, b PathCost) bool {
+	if a.CompositeErr <= 0 || b.CompositeErr <= 0 {
+		return false
+	}
+	loA, hiA := a.Composite-a.CompositeErr, a.Composite+a.CompositeErr
+	loB, hiB := b.Composite-b.CompositeErr, b.Composite+b.CompositeErr
+	return loA <= hiB && loB <= hiA
 }

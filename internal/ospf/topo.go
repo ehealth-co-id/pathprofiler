@@ -9,10 +9,10 @@ import (
 
 // PhysicalPath is one way to reach a BGP loopback via the OSPF underlay.
 type PhysicalPath struct {
-	Loopback   string // BGP next-hop, e.g. "10.255.0.3"
-	Interface  string // e.g. "wg0" or "ens21"
-	PhysicalNH string // OSPF next-hop, e.g. "192.168.200.3"
-	Cost       int    // OSPF cost
+	Loopback  string // BGP next-hop, e.g. "10.255.0.3"
+	Interface string // e.g. "wg0" or "ens21"
+	GatewayIP string // first-hop gateway IP, e.g. "192.168.200.3"
+	Cost      int    // OSPF cost
 }
 
 // Underlay maps each BGP loopback to its candidate physical paths.
@@ -96,15 +96,15 @@ func ParseRoute(jsonBytes []byte, loopback string) ([]PhysicalPath, error) {
 	}
 
 	var paths []PhysicalPath
-	for _, nh := range entry.Nexthops {
-		if strings.TrimSpace(nh.IP) == "" {
+	for _, nhop := range entry.Nexthops {
+		if strings.TrimSpace(nhop.IP) == "" {
 			continue // directly-attached route, not a remote path
 		}
 		paths = append(paths, PhysicalPath{
-			Loopback:   loopback,
-			Interface:  nh.Via,
-			PhysicalNH: nh.IP,
-			Cost:       entry.Cost,
+			Loopback:  loopback,
+			Interface: nhop.Via,
+			GatewayIP: nhop.IP,
+			Cost:      entry.Cost,
 		})
 	}
 	return paths, nil
@@ -134,23 +134,23 @@ func (u Underlay) PathsTo(loopback string) []PhysicalPath {
 	return u[loopback]
 }
 
-// LoopbackForPhysicalNH returns the BGP loopback that routes through physIP
-// as its OSPF next-hop. This is the reverse of PhysicalPath.PhysicalNH.
+// LoopbackForGateway returns the BGP loopback that routes through gatewayIP
+// as its first-hop gateway. This is the reverse of PhysicalPath.GatewayIP.
 //
-// Precondition: physIP must uniquely identify a single loopback in the
+// Precondition: gatewayIP must uniquely identify a single loopback in the
 // underlay. This holds in the current deployment (192.168.200.X maps 1:1
 // to 10.255.0.X) but is NOT a general guarantee — a transit topology
 // where two loopbacks share a first-hop router would violate it.
 //
-// On ambiguity (multiple loopbacks reachable via the same physical NH),
+// On ambiguity (multiple loopbacks reachable via the same gateway IP),
 // returns ("", error) rather than silently picking one — a future
 // topology change should surface as a visible failure, not misattributed
 // passive traffic. (Finding 2.)
-func (u Underlay) LoopbackForPhysicalNH(physIP string) (string, error) {
+func (u Underlay) LoopbackForGateway(gatewayIP string) (string, error) {
 	var found []string
 	for loopback, paths := range u {
 		for _, pp := range paths {
-			if pp.PhysicalNH == physIP {
+			if pp.GatewayIP == gatewayIP {
 				found = append(found, loopback)
 				break // one match per loopback is enough
 			}
@@ -162,7 +162,7 @@ func (u Underlay) LoopbackForPhysicalNH(physIP string) (string, error) {
 	case 1:
 		return found[0], nil
 	default:
-		return "", fmt.Errorf("ospf: physical NH %s maps to multiple loopbacks %v (uniqueness precondition violated)", physIP, found)
+		return "", fmt.Errorf("ospf: gateway %s maps to multiple loopbacks %v (uniqueness precondition violated)", gatewayIP, found)
 	}
 }
 

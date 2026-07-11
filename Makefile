@@ -7,11 +7,11 @@ TARGET_ARCH ?= $(shell uname -m | sed 's/x86_64/x86/; s/aarch64/arm64/')
 BPF_CFLAGS := -O2 -g -target bpf -D__TARGET_ARCH_$(TARGET_ARCH) -I. \
               -I/usr/include/$(shell uname -m)-linux-gnu
 
-BPF_OBJS := bpf/egress_sockops.bpf.o bpf/egress_retrans.bpf.o bpf/ingress_xdp.bpf.o
+BPF_OBJS := bpf/ingress_xdp.bpf.o bpf/transit_loss.bpf.o
 
-.PHONY: all bpf daemon clean vmlinux
+.PHONY: all bpf daemon responder clean vmlinux
 
-all: vmlinux bpf daemon
+all: vmlinux bpf daemon responder
 
 # vmlinux.h provides kernel type definitions for CO-RE BPF programs.
 # Prefer generating it from the TARGET kernel's BTF (most accurate for
@@ -42,5 +42,11 @@ daemon: bpf
 	cp bpf/*.bpf.o internal/loader/
 	cd cmd/daemon && GOOS=$${GOOS:-linux} GOARCH=$${GOARCH:-amd64} go build -o ../../bin/pathprofiler-daemon .
 
+# Standalone cold-probe echo responder. Deliberately does NOT depend on bpf/
+# vmlinux -- internal/actuate has no dependency on internal/loader/internal/
+# maps, so this builds with plain go build, no BPF toolchain required.
+responder:
+	cd cmd/responder && GOOS=$${GOOS:-linux} GOARCH=$${GOARCH:-amd64} go build -o ../../bin/pathprofiler-responder .
+
 clean:
-	rm -f bpf/*.bpf.o internal/loader/*.bpf.o bin/pathprofiler-daemon
+	rm -f bpf/*.bpf.o internal/loader/*.bpf.o bin/pathprofiler-daemon bin/pathprofiler-responder

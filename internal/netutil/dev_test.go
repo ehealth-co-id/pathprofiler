@@ -87,8 +87,8 @@ func TestResolveDevice_CommandError(t *testing.T) {
 func TestResolvePaths_UsesUnderlayWhenAvailable(t *testing.T) {
 	underlay := ospf.Underlay{
 		"10.255.0.3": {
-			{Loopback: "10.255.0.3", Interface: "wg0", PhysicalNH: "192.168.200.3", Cost: 50},
-			{Loopback: "10.255.0.3", Interface: "ens21", PhysicalNH: "192.168.200.3", Cost: 60},
+			{Loopback: "10.255.0.3", Interface: "wg0", GatewayIP: "192.168.200.3", Cost: 50},
+			{Loopback: "10.255.0.3", Interface: "ens21", GatewayIP: "192.168.200.3", Cost: 60},
 		},
 	}
 	paths, err := ResolvePaths("10.255.0.3", underlay)
@@ -129,8 +129,8 @@ func TestResolvePaths_FallsBackToIPRouteGet(t *testing.T) {
 	if paths[0].Loopback != "192.168.3.200" {
 		t.Errorf("Loopback = %q, want 192.168.3.200", paths[0].Loopback)
 	}
-	if paths[0].PhysicalNH != "" {
-		t.Errorf("PhysicalNH should be empty for fallback, got %q", paths[0].PhysicalNH)
+	if paths[0].GatewayIP != "" {
+		t.Errorf("GatewayIP should be empty for fallback, got %q", paths[0].GatewayIP)
 	}
 }
 

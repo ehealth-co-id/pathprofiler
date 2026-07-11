@@ -1,7 +1,6 @@
 # /etc/pathprofiler.yaml — pathprofiler daemon config
-# NOTE: as of this release the daemon does not yet read this file
-# (internal/config.Load is implemented but not wired into cmd/daemon/main.go).
-# Flags --poll / --min-dwell / --min-margin on ExecStart are what take effect.
+# All fields are optional; anything omitted falls back to the defaults shown
+# below. CLI flags on ExecStart override these (0 / unset flag = use YAML).
 
 scope:
   prefixes: []   # CIDRs to actuate on; empty = all RIB prefixes
@@ -15,3 +14,18 @@ probe:
   port: 33434
   timeout_seconds: 2
   interval_seconds: 60
+
+  # Adaptive cold-probe SPRT (three-decision Wald test comparing a candidate
+  # next-hop's loss rate against the currently active path's).
+  min_count: 5    # probes sent per tick for a leg with no accumulated evidence yet
+  max_count: 30   # ceiling on accumulated effective sample size (see ema_half_life_seconds)
+  delta: 0.02     # indifference band in loss-rate units
+  alpha: 0.05     # SPRT Type-I error (false-better / false-worse rate)
+  beta: 0.05      # SPRT Type-II error (miss a real delta-difference)
+
+  # Cross-tick SPRT accumulation: each tick sends only min_count probes, but
+  # the SPRT evaluates against evidence decayed and carried forward across
+  # ticks (half-life below), so it can resolve without one huge blocking burst.
+  ema_half_life_seconds: 300     # decay half-life for accumulated probe evidence
+  timeout_rtt_multiplier: 8.0    # adaptive per-probe timeout = multiplier * RTT baseline
+  min_timeout_ms: 20             # floor for the adaptive per-probe timeout

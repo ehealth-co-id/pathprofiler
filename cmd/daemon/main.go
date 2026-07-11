@@ -9,6 +9,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"math"
 	"net"
 	"sort"
 	"time"
@@ -18,6 +19,7 @@ import (
 	"pathprofiler/internal/config"
 	"pathprofiler/internal/loader"
 	"pathprofiler/internal/maps"
+	"pathprofiler/internal/metrics"
 	"pathprofiler/internal/netutil"
 	"pathprofiler/internal/ospf"
 	"pathprofiler/internal/score"
@@ -31,6 +33,16 @@ func main() {
 	probeIntervalSec := flag.Int("probe-interval", 0, "cold-probe and topology-refresh interval in seconds (overrides YAML; 0 = use YAML)")
 	probePort := flag.Int("probe-port", 0, "UDP port for cold-path probes (overrides YAML; 0 = use YAML)")
 	probeTimeoutSec := flag.Int("probe-timeout", 0, "cold-probe timeout in seconds (overrides YAML; 0 = use YAML)")
+	probeCount := flag.Int("probe-count", 0, "number of probes per burst (overrides YAML; 0 = use YAML)")
+	probeCountMax := flag.Int("probe-count-max", 0, "maximum accumulated probes for adaptive SPRT (overrides YAML; 0 = use YAML)")
+	probeDelta := flag.Float64("probe-delta", 0, "indifference band in loss-rate units (overrides YAML; 0 = use YAML)")
+	probeAlpha := flag.Float64("probe-alpha", 0, "SPRT Type-I error rate (overrides YAML; 0 = use YAML)")
+	probeBeta := flag.Float64("probe-beta", 0, "SPRT Type-II error rate (overrides YAML; 0 = use YAML)")
+	probeEMAHalfLifeSec := flag.Int("probe-ema-half-life", 0, "half-life in seconds for accumulated cold-probe SPRT evidence across ticks (overrides YAML; 0 = use YAML)")
+	probeTimeoutMultiplierFlag := flag.Float64("probe-timeout-multiplier", 0, "adaptive per-probe timeout = multiplier * RTT baseline (overrides YAML; 0 = use YAML)")
+	probeMinTimeoutMsFlag := flag.Int("probe-min-timeout-ms", 0, "floor for the adaptive per-probe timeout, in milliseconds (overrides YAML; 0 = use YAML)")
+	transitEMAHalfLife := flag.Duration("transit-ema-half-life", 5*time.Minute, "EMA half-life for transit loss-rate smoothing")
+	verbose := flag.Bool("verbose", false, "log per-path cold-probe detail")
 	flag.Parse()
 	// ponytail: --min-margin is no longer used in the tier-based design
 	// (RankByTier replaces ShouldSwitch), but kept for CLI compatibility.
@@ -53,6 +65,40 @@ func main() {
 	probeTimeout := time.Duration(cfg.Probe.TimeoutSeconds) * time.Second
 	if *probeTimeoutSec > 0 {
 		probeTimeout = time.Duration(*probeTimeoutSec) * time.Second
+	}
+
+	// CLI overrides for adaptive probe config: non-zero / non-default means "use CLI".
+	adaptiveMinN := cfg.Probe.MinCount
+	if *probeCount > 0 {
+		adaptiveMinN = *probeCount
+	}
+	adaptiveMaxN := cfg.Probe.MaxCount
+	if *probeCountMax > 0 {
+		adaptiveMaxN = *probeCountMax
+	}
+	adaptiveDelta := cfg.Probe.Delta
+	if *probeDelta > 0 {
+		adaptiveDelta = *probeDelta
+	}
+	adaptiveAlpha := cfg.Probe.Alpha
+	if *probeAlpha > 0 {
+		adaptiveAlpha = *probeAlpha
+	}
+	adaptiveBeta := cfg.Probe.Beta
+	if *probeBeta > 0 {
+		adaptiveBeta = *probeBeta
+	}
+	probeEMAHalfLife := time.Duration(cfg.Probe.EMAHalfLifeSeconds) * time.Second
+	if *probeEMAHalfLifeSec > 0 {
+		probeEMAHalfLife = time.Duration(*probeEMAHalfLifeSec) * time.Second
+	}
+	probeTimeoutMultiplier := cfg.Probe.TimeoutRTTMultiplier
+	if *probeTimeoutMultiplierFlag > 0 {
+		probeTimeoutMultiplier = *probeTimeoutMultiplierFlag
+	}
+	probeMinTimeout := time.Duration(cfg.Probe.MinTimeoutMs) * time.Millisecond
+	if *probeMinTimeoutMsFlag > 0 {
+		probeMinTimeout = time.Duration(*probeMinTimeoutMsFlag) * time.Millisecond
 	}
 
 	// --- BPF loader: load programs, pin maps, attach to kernel ---
@@ -97,13 +143,35 @@ func main() {
 		appliedNeighbors = make(map[string]bool)
 	}
 
-	prevEgress := make(map[maps.PathKey]maps.EgressStats)
-	prevIngress := make(map[uint32]maps.IngressStats)
+	prevTransit := make(map[maps.PathKey]maps.TransitStats)
+	transitEMA := metrics.NewEMAStore(10*time.Second, *transitEMAHalfLife)
 
 	var cachedRIB map[string][]bgp.Path
 	var cachedUnderlay ospf.Underlay
 	lastTopoFetch := time.Time{} // zero forces first fetch
 	xdpRetried := false          // track whether we've retried XDP after startup
+	tcAttached := false          // track whether TC egress programs have been attached
+	tcDoneStaleCleanup := false  // track whether stale TC detach ran on first topo refresh
+	firstTopoRefresh := true     // tripwire: log dst_to_nexthop count after first populate
+
+	// appliedActiveComposite/appliedActiveNeighbor mirror, per prefix, the
+	// neighbor last confirmed to hold top tier (cfg.Tiers.Local) in FRR's
+	// live route-maps -- confirmed meaning a dampener-allowed, successfully
+	// applied actuate.SetNeighborTiers call, not just this tick's raw
+	// ranking. Written only in step 7 (actuation), read in step 4
+	// (cold-probe) as this tick's SPRT baseline. Because the mirror only
+	// changes when the dampener actually lets an update through, its
+	// identity is rate-limited by --min-dwell instead of flapping with
+	// every tick's EMA noise or a tier-flip that never actually made it
+	// into FRR.
+	appliedActiveComposite := make(map[string]float64)
+	appliedActiveNeighbor := make(map[string]string)
+
+	// probeAccumulators carries decayed SPRT evidence per (prefix, iface,
+	// next-hop) leg across ticks -- see actuate.ProbeAccumulator. Not pruned
+	// when a leg disappears; bounded by the number of distinct legs ever
+	// seen, negligible in practice (same convention as appliedActiveComposite).
+	probeAccumulators := make(map[actuate.ProbeKey]*actuate.ProbeAccumulator)
 
 	ticker := time.NewTicker(*pollInterval)
 	defer ticker.Stop()
@@ -135,8 +203,39 @@ func main() {
 				}
 			}
 
-			// --- Populate dst_to_nexthop for BPF sockops ---
-			populateDstToNexthop(reader, prevEgress)
+			// --- Detach stale TC programs from prior runs before first attach ---
+			if !tcDoneStaleCleanup && len(cachedUnderlay) > 0 {
+				tcDoneStaleCleanup = true
+				tcIfaces := uniqueTcIfaces(cachedUnderlay)
+				loader.DetachStaleTC(tcIfaces)
+			}
+
+			// --- Retry TC attach once underlay is available ---
+			if !tcAttached && len(cachedUnderlay) > 0 {
+				tcIfaces := uniqueTcIfaces(cachedUnderlay)
+				if len(tcIfaces) > 0 {
+					if err := bpfLoader.AttachTC(tcIfaces); err != nil {
+						log.Printf("TC attach (retrying next tick): %v", err)
+						// Do NOT set tcAttached=true here — failure must retry.
+					} else {
+						tcAttached = true
+						log.Printf("TC attached to %d interfaces: %v", len(tcIfaces), tcIfaces)
+					}
+				}
+			}
+
+			// --- Populate dst_to_nexthop for BPF programs ---
+			inScopeRefresh := bgp.InScope(cachedRIB, cfg.Scope.Prefixes)
+			populateDstToNexthopFromRIB(reader, inScopeRefresh)
+
+			// Tripwire: log entry count after first populate.
+			if firstTopoRefresh {
+				firstTopoRefresh = false
+				log.Printf("dst_to_nexthop populated: %d entries (prefixes=%d)", dstToNexthopEntryCount, len(inScopeRefresh))
+				if dstToNexthopEntryCount == 0 || dstToNexthopEntryCount < len(inScopeRefresh) {
+					log.Printf("dst_to_nexthop: population may be incomplete — check ip route get for in-scope prefixes")
+				}
+			}
 		}
 
 		if len(cachedRIB) == 0 {
@@ -145,107 +244,211 @@ func main() {
 
 		inScope := bgp.InScope(cachedRIB, cfg.Scope.Prefixes)
 
-		// --- 2. Passive scores from BPF maps ---
-		egressNow, err := reader.AllEgress()
+		// --- 2. Transit loss pipeline ---
+		transitNow, err := reader.AllTransit()
 		if err != nil {
-			log.Printf("read egress map: %v", err)
-			continue
-		}
-		ingressNow, err := reader.AllIngress()
-		if err != nil {
-			log.Printf("read ingress map: %v", err)
+			log.Printf("read transit map: %v", err)
 			continue
 		}
 
-		passiveByPrefix := make(map[string][]score.PathCost)
-		passiveLegs := make(map[string]bool) // F1: "neighbor:interface" keys
-
-		for pk, cur := range egressNow {
-			prev := prevEgress[pk]
-
-			srttSamplesDelta := diff(cur.SrttSamples, prev.SrttSamples)
-			srttSumDelta := diff(cur.SrttUsSum, prev.SrttUsSum)
-			retransDelta := diff(cur.Retransmits, prev.Retransmits)
-			bytesDelta := diff(cur.BytesAcked, prev.BytesAcked)
-
-			ing := ingressNow[pk.NextHopIP]
-			prevIng := prevIngress[pk.NextHopIP]
-			iatSamplesDelta := diff(ing.IatSamples, prevIng.IatSamples)
-			iatSumDelta := diff(ing.IatSumNs, prevIng.IatSumNs)
-			iatSqDelta := diff(ing.IatSqSumNs, prevIng.IatSqSumNs)
-			gapsDelta := diff(ing.SeqGaps, prevIng.SeqGaps)
-			packetsDelta := diff(ing.Packets, prevIng.Packets)
-
-			c := score.Compute(pk.NextHopIP,
-				srttSumDelta, srttSamplesDelta, retransDelta, bytesDelta,
-				iatSumDelta, iatSqDelta, iatSamplesDelta, gapsDelta, packetsDelta,
-				score.DefaultWeights)
-
-			nhStr := uint32ToIPStr(pk.NextHopIP)
-			subnetStr := uint32ToIPStr(pk.DstSubnet)
-
-			prefix := bgp.PrefixForSubnet(inScope, subnetStr)
-			if prefix == "" {
-				continue
+		transitDeltas := make(map[maps.PathKey]metrics.TransitDelta)
+		for pk, cur := range transitNow {
+			prev := prevTransit[pk]
+			transitDeltas[pk] = metrics.TransitDelta{
+				Segments:    diff(cur.Segments, prev.Segments),
+				Retransmits: diff(cur.Retransmits, prev.Retransmits),
 			}
+		}
+		transitEMA.Update(time.Now(), *pollInterval, transitDeltas)
+		emaSnapshot := transitEMA.Snapshot()
+		log.Printf("transit map: %d entries, ema snapshot: %d paths", len(transitNow), len(emaSnapshot))
+		prevTransit = transitNow
 
-			neighbor, resolvedIface := findNeighborForPath(inScope, prefix, nhStr, cachedUnderlay)
-			if neighbor == "" {
-				continue
+		// Tripwire: if dst_to_nexthop misses are dropping everything.
+		dd, ddErr := reader.DebugDropped()
+		if ddErr == nil && dd > 0 && len(transitNow) == 0 {
+			log.Printf("transit: all packets dropped (dst_to_nexthop miss) — debug_dropped=%d", dd)
+		}
+
+		// Verbose: log transit diagnostic every tick regardless of entries.
+		if *verbose {
+			dd, ddErr := reader.DebugDropped()
+			ddVal := uint64(0)
+			if ddErr == nil {
+				ddVal = dd
 			}
-			c.Neighbor = neighbor
-			passiveByPrefix[prefix] = append(passiveByPrefix[prefix], c)
-
-			// F1 per-leg tracking.
-			if resolvedIface != "" {
-				passiveLegs[neighbor+":"+resolvedIface] = true
-			} else {
-				// BPF returned loopback directly — kernel did ECMP
-				// resolution below the loopback; conservatively mark
-				// all legs as having traffic to avoid over-probing
-				// (strictly cheaper failure mode per F1).
-				if paths := cachedUnderlay.PathsTo(nhStr); len(paths) > 0 {
-					for _, pp := range paths {
-						passiveLegs[neighbor+":"+pp.Interface] = true
-					}
+			log.Printf("[verbose] transit diag: map_entries=%d ema_paths=%d debug_dropped=%d interface_count=%d",
+				len(transitNow), len(emaSnapshot), ddVal, len(cachedUnderlay))
+			if len(transitNow) > 0 {
+				for pk, st := range transitNow {
+					log.Printf("[verbose] transit entry: nh=%s dst_subnet=%s seg=%d retrans=%d last_update_ago=%s",
+						uint32ToIPStr(pk.NextHopIP), uint32ToIPStr(pk.DstSubnet),
+						st.Segments, st.Retransmits,
+						time.Since(time.Unix(0, int64(st.LastUpdateNs))).Round(time.Second))
 				}
 			}
 		}
 
-		prevEgress = egressNow
-		prevIngress = ingressNow
+		// Log transit debug counters for dst_to_nexthop misses.
+		if len(transitNow) > 0 {
+			for pk, st := range transitNow {
+				if st.Retransmits > 0 {
+					log.Printf("transit raw: nh=%s dst_subnet=%s seg=%d retrans=%d",
+						uint32ToIPStr(pk.NextHopIP), uint32ToIPStr(pk.DstSubnet),
+						st.Segments, st.Retransmits)
+				}
+			}
+		}
 
-		// --- 3. Cold-path probes (F1: per-leg gate) ---
+		// --- 4. Cold-path probes ---
+		// activeComposite is seeded from appliedActiveComposite (the neighbor
+		// last confirmed applied at top tier for this prefix, as of the
+		// previous tick's actuation step), so the SPRT has a real baseline
+		// from the second tick onward. Falls back to +Inf (fixed minN burst,
+		// OutcomeUndecided) on the first tick for a prefix, or once a prefix
+		// loses its confirmed-active neighbor, since there's nothing yet to
+		// compare against.
+
 		coldByPrefix := make(map[string][]score.PathCost)
+		{
+			totalPaths := 0
+			for _, pp := range inScope {
+				totalPaths += len(pp)
+			}
+			log.Printf("cold probe: scanning %d prefixes, %d BGP paths", len(inScope), totalPaths)
+		}
 		for prefix, paths := range inScope {
+			activeComposite, hasBaseline := appliedActiveComposite[prefix]
+			activeNeighbor := appliedActiveNeighbor[prefix]
+			if !hasBaseline {
+				activeComposite = math.Inf(1)
+			}
 			for _, p := range paths {
-				physPaths, _ := netutil.ResolvePaths(p.NextHop, cachedUnderlay)
+				physPaths, rpErr := netutil.ResolvePaths(p.NextHop, cachedUnderlay)
+				if rpErr != nil {
+					log.Printf("probe %s (neighbor %s, prefix %s): resolve paths: %v", p.NextHop, p.Neighbor, prefix, rpErr)
+				}
 				for _, pp := range physPaths {
-					// F1: gate per-leg — skip if this specific leg has
-					// live traffic, regardless of sibling-leg status.
-					if !gateColdProbeLeg(p.Neighbor, pp.Interface, passiveLegs) {
-						continue
+					if *verbose {
+						log.Printf("[verbose] probing prefix=%s neighbor=%s nexthop=%s iface=%s gateway=%s",
+							prefix, p.Neighbor, p.NextHop, pp.Interface, pp.GatewayIP)
 					}
-					r, err := actuate.ProbeNextHop(pp.Interface, p.NextHop, probePortVal, probeTimeout)
+					key := actuate.ProbeKey{Prefix: prefix, Iface: pp.Interface, NextHop: p.NextHop}
+					acc := probeAccumulators[key]
+					if acc == nil {
+						acc = &actuate.ProbeAccumulator{}
+						probeAccumulators[key] = acc
+					}
+					r, outcome, err := actuate.ProbeNextHopAccumulating(pp.Interface, p.NextHop, probePortVal,
+						probeTimeout, adaptiveMinN, adaptiveMaxN, acc, time.Now(), probeEMAHalfLife,
+						probeTimeoutMultiplier, probeMinTimeout, activeComposite,
+						adaptiveDelta, adaptiveAlpha, adaptiveBeta, score.DefaultWeights.EgressLoss)
 					if err != nil {
 						log.Printf("probe %s via %s: %v", p.NextHop, pp.Interface, err)
 						continue
 					}
-					synthetic := score.FromProbeResult(ipStrToUint32(p.NextHop), r.RTT, r.Lost)
+					synthetic := score.FromProbeResult(ipStrToUint32(p.NextHop), r.RTT, r.LossRate, r.LossRateErr)
 					synthetic.Neighbor = p.Neighbor
 					coldByPrefix[prefix] = append(coldByPrefix[prefix], synthetic)
-					log.Printf("cold probe %s via %s (iface %s): rtt=%v lost=%v",
-						p.Neighbor, p.NextHop, pp.Interface, r.RTT, r.Lost)
+					baselineStr := "none (no active path for this prefix yet)"
+					if hasBaseline {
+						baselineStr = fmt.Sprintf("%.0f vs active neighbor %s", activeComposite, activeNeighbor)
+					}
+					log.Printf("cold probe %s via %s (iface %s): rtt=%v lossRate=%.2f err=±%.3f probes=%d/%d (cumulative) outcome=%s baseline=%s",
+						p.Neighbor, p.NextHop, pp.Interface, r.RTT, r.LossRate, r.LossRateErr, r.ProbeCount, adaptiveMaxN, outcome, baselineStr)
 				}
 			}
 		}
 
-		// --- 4. Rank per prefix -> group by neighbor ---
+		// --- 5. Transit override + visibility log ---
+		// Real forwarded-traffic loss replaces the synthetic probe loss rate
+		// on matching (prefix, loopback) entries. Confidence is bumped from
+		// transit segment count so RankByTier's Confidence>=0.5 gate can
+		// promote the neighbor above defaultTier.
+		transitSeen := make(map[string]bool)
+		// F6: skip-reason counters so the "NO Confidence>0" warning below can
+		// name which gate dropped every ema entry, instead of that having to
+		// be re-diagnosed by hand from raw logs each time it fires.
+		var skippedZeroWindow, skippedNoPrefix, skippedAmbiguousNH, skippedNoColdMatch int
+		for pk, ema := range emaSnapshot {
+			if ema.WindowSegments == 0 {
+				skippedZeroWindow++
+				continue
+			}
+			prefix := bgp.PrefixForSubnet(inScope, uint32ToIPStr(pk.DstSubnet))
+			if prefix == "" {
+				skippedNoPrefix++
+				continue
+			}
+			nextHopStr := uint32ToIPStr(pk.NextHopIP)
+			logKey := nextHopStr + ":" + prefix
+			nhToMatch := pk.NextHopIP
+			if cachedUnderlay != nil {
+				if lb, err := cachedUnderlay.LoopbackForGateway(nextHopStr); err != nil {
+					log.Printf("transit override: ambiguous NH %s: %v — skipping", nextHopStr, err)
+					skippedAmbiguousNH++
+					continue
+				} else if lb != "" {
+					nhToMatch = ipStrToUint32(lb)
+				}
+			}
+			if !transitSeen[logKey] {
+				transitSeen[logKey] = true
+				log.Printf("transit nexthop=%s prefix=%s seg=%d ema_loss=%.4f err=±%.4f",
+					nextHopStr, prefix, ema.WindowSegments, ema.EMALossRate, ema.EMALossRateErr)
+			}
+			matched := false
+			for i := range coldByPrefix[prefix] {
+				if coldByPrefix[prefix][i].NextHopIP == nhToMatch {
+					matched = true
+					pc := &coldByPrefix[prefix][i]
+					pc.EgressLossRate = ema.EMALossRate
+					pc.CompositeErr = score.DefaultWeights.EgressLoss * ema.EMALossRateErr
+					if ema.EMALossRate > 0 || ema.WindowSegments >= 5 {
+						pc.Confidence = score.ConfidenceFromSamples(ema.WindowSegments)
+					}
+					pc.RecomputeComposite(score.DefaultWeights)
+				}
+			}
+			if !matched {
+				skippedNoColdMatch++
+			}
+		}
+
+		// Self-check: warn if no entry has Confidence>0 after transit override.
+		hasConfidence := false
+		for _, entries := range coldByPrefix {
+			for _, pc := range entries {
+				if pc.Confidence > 0 {
+					hasConfidence = true
+					break
+				}
+			}
+			if hasConfidence {
+				break
+			}
+		}
+		if len(coldByPrefix) > 0 && !hasConfidence {
+			log.Printf("transit override: NO cold-probe entry has Confidence>0 — "+
+				"transit data may not be flowing (check TC attachment) "+
+				"[ema_paths=%d zeroWindow=%d noPrefix=%d ambiguousNH=%d noColdMatch=%d]",
+				len(emaSnapshot), skippedZeroWindow, skippedNoPrefix, skippedAmbiguousNH, skippedNoColdMatch)
+		}
+
+		// --- 6. Rank per prefix -> group by neighbor ---
+		// candidateComposite records every candidate's Composite for this
+		// tick, keyed by prefix then neighbor, so step 7 can look up "what
+		// was this neighbor's composite for this prefix, this tick" once it
+		// knows which update actually got applied -- without re-deriving it.
+		candidateComposite := make(map[string]map[string]float64)
 		var perPrefixUpdates [][]actuate.NeighborTierUpdate
 		for prefix := range inScope {
-			candidates := passiveByPrefix[prefix]
-			candidates = append(candidates, coldByPrefix[prefix]...)
+			candidates := coldByPrefix[prefix]
 			candidates = score.CollapseByNeighbor(candidates)
+			candidateComposite[prefix] = make(map[string]float64, len(candidates))
+			for _, c := range candidates {
+				candidateComposite[prefix][c.Neighbor] = c.Composite
+			}
 			updates := score.RankByTier(candidates, prefix,
 				cfg.Tiers.Local, cfg.Tiers.Dedicated, cfg.Tiers.Default)
 			if len(updates) > 0 {
@@ -254,7 +457,7 @@ func main() {
 		}
 		updates := score.GroupByNeighbor(perPrefixUpdates)
 
-		// --- 5. Actuate per neighbor ---
+		// --- 7. Actuate per neighbor ---
 		thisTickNeighbors := make(map[string]bool)
 		for _, u := range updates {
 			thisTickNeighbors[u.Neighbor] = true
@@ -268,9 +471,12 @@ func main() {
 			}
 			dampener.Record(u.Neighbor)
 			log.Printf("neighbor %s: applied %d prefix tiers", u.Neighbor, len(u.Prefs))
+
+			syncAppliedActiveMirror(appliedActiveNeighbor, appliedActiveComposite,
+				candidateComposite, u, cfg.Tiers.Local)
 		}
 
-		// --- 6. Cleanup (Drained -> Absent) ---
+		// --- 8. Cleanup (Drained -> Absent) ---
 		for nb := range appliedNeighbors {
 			if !thisTickNeighbors[nb] {
 				if err := actuate.RemoveNeighborTiers(nb); err != nil {
@@ -284,29 +490,56 @@ func main() {
 	}
 }
 
-// populateDstToNexthop sweeps passive egress destinations and populates the
-// dst_to_nexthop BPF map via `ip route get`. Runs at probeInterval cadence
-// (alongside topology refresh) because route changes are slow.
-func populateDstToNexthop(reader *maps.Reader, egressNow map[maps.PathKey]maps.EgressStats) {
+// populateDstToNexthopFromRIB iterates in-scope BGP prefixes and writes one
+// LPM trie entry per prefix into dst_to_nexthop. For each prefix, the
+// daemon resolves the next-hop for a representative IP in the prefix
+// (network address + 1, e.g. 10.255.0.1 for 10.255.0.0/24). The LPM trie
+// lookup with prefixlen=32 in BPF matches any destination in the prefix.
+//
+// This decouples dst_to_nexthop population from having any passive egress
+// data — it works from the RIB alone, fixing the bootstrap deadlock where
+// transit traffic can never populate the map because the map is needed for
+// transit traffic to produce data.
+var dstToNexthopEntryCount int
+
+func populateDstToNexthopFromRIB(reader *maps.Reader, inScope map[string][]bgp.Path) {
 	if reader.DstToNexthop() == nil {
-		return // map not available (older daemon or first boot)
+		return
 	}
-	// Dedupe destination IPs from passive egress keys.
-	seen := make(map[uint32]bool)
-	for pk := range egressNow {
-		seen[pk.DstSubnet] = true // ponytail: use /24 subnet, not full IP, to keep sweep small
-	}
-	for dst := range seen {
-		dstStr := uint32ToIPStr(dst)
-		nh, err := netutil.ResolveNexthop(dstStr)
+	count := 0
+	for prefix := range inScope {
+		_, ipNet, err := net.ParseCIDR(prefix)
 		if err != nil {
 			continue
 		}
-		nhU32 := ipStrToUint32(nh)
-		if err := reader.UpdateDstToNexthop(dst, nhU32); err != nil {
-			log.Printf("populate dst_to_nexthop[%s]: %v", dstStr, err)
+		// Pick the first usable host address in the prefix as the
+		// representative. ip route get <this_ip> resolves the
+		// kernel's next-hop for the prefix, and the LPM trie
+		// covers all destinations within it.
+		rep := ipNet.IP.Mask(ipNet.Mask)
+		if len(rep) != 4 {
+			continue
 		}
+		rep3 := make(net.IP, 4)
+		copy(rep3, rep)
+		rep3[3]++ // first usable host
+		repStr := rep3.String()
+
+		nh, err := netutil.ResolveNexthop(repStr)
+		if err != nil {
+			log.Printf("populate dst_to_nexthop[%s]: resolve nexthop: %v", repStr, err)
+			continue
+		}
+		nextHopU32 := ipStrToUint32(nh)
+		daddr := uint32(rep3[0]) | uint32(rep3[1])<<8 | uint32(rep3[2])<<16 | uint32(rep3[3])<<24
+		ones, _ := ipNet.Mask.Size()
+		if err := reader.UpdateDstToNexthop(uint32(ones), daddr, nextHopU32); err != nil {
+			log.Printf("populate dst_to_nexthop[%s/%d]: %v", repStr, ones, err)
+			continue
+		}
+		count++
 	}
+	dstToNexthopEntryCount = count
 }
 
 // ifacesFromUnderlay extracts the deduplicated set of (interface, gateway-IP)
@@ -316,12 +549,12 @@ func ifacesFromUnderlay(underlay ospf.Underlay) []loader.IfaceAttach {
 	var result []loader.IfaceAttach
 	for _, paths := range underlay {
 		for _, pp := range paths {
-			key := pp.Interface + ":" + pp.PhysicalNH
+			key := pp.Interface + ":" + pp.GatewayIP
 			if seen[key] {
 				continue
 			}
 			seen[key] = true
-			ip := net.ParseIP(pp.PhysicalNH).To4()
+			ip := net.ParseIP(pp.GatewayIP).To4()
 			if ip == nil {
 				continue
 			}
@@ -329,6 +562,22 @@ func ifacesFromUnderlay(underlay ospf.Underlay) []loader.IfaceAttach {
 				Iface:     pp.Interface,
 				GatewayIP: uint32(ip[0])<<24 | uint32(ip[1])<<16 | uint32(ip[2])<<8 | uint32(ip[3]),
 			})
+		}
+	}
+	return result
+}
+
+// uniqueTcIfaces extracts the deduplicated set of interface names from OSPF
+// underlay data, for TC egress program attachment.
+func uniqueTcIfaces(underlay ospf.Underlay) []string {
+	seen := make(map[string]bool)
+	var result []string
+	for _, paths := range underlay {
+		for _, pp := range paths {
+			if !seen[pp.Interface] {
+				seen[pp.Interface] = true
+				result = append(result, pp.Interface)
+			}
 		}
 	}
 	return result
@@ -372,50 +621,6 @@ func discoverGatewayIfaces() ([]loader.IfaceAttach, error) {
 	return ifaces, nil
 }
 
-// findNeighborForPath resolves a passive egress key's next-hop to a BGP
-// neighbor. Returns (neighbor, resolvedInterface). If BPF returned the
-// loopback directly, resolvedInterface is "" (caller conservatively marks
-// all legs). If BPF returned a physical OSPF NH, resolvedInterface is set
-// to the specific PhysicalPath.Interface.
-func findNeighborForPath(inScope map[string][]bgp.Path, prefix, nhStr string, underlay ospf.Underlay) (neighbor, resolvedIface string) {
-	// Direct match: BPF next-hop is a BGP loopback in the RIB.
-	for _, p := range inScope[prefix] {
-		if p.NextHop == nhStr {
-			return p.Neighbor, ""
-		}
-	}
-
-	// F2: BPF returned a physical OSPF NH — reverse lookup to find the loopback.
-	loopback, err := underlay.LoopbackForPhysicalNH(nhStr)
-	if err != nil {
-		log.Printf("resolve physical NH %s: %v (skipping)", nhStr, err)
-		return "", ""
-	}
-	if loopback == "" {
-		return "", ""
-	}
-
-	for _, p := range inScope[prefix] {
-		if p.NextHop == loopback {
-			// Find the PhysicalPath whose PhysicalNH matches.
-			for _, pp := range underlay.PathsTo(loopback) {
-				if pp.PhysicalNH == nhStr {
-					return p.Neighbor, pp.Interface
-				}
-			}
-			return p.Neighbor, ""
-		}
-	}
-	return "", ""
-}
-
-// gateColdProbeLeg returns true if this specific physical leg should be
-// cold-probed (i.e., it does NOT have passive traffic). Extracted for
-// testability (F1).
-func gateColdProbeLeg(neighbor, iface string, passiveLegs map[string]bool) bool {
-	return !passiveLegs[neighbor+":"+iface]
-}
-
 func diff(cur, prev uint64) uint64 {
 	if cur < prev {
 		return 0 // counter reset (LRU eviction/reload) -- treat as no delta this tick, not negative
@@ -423,11 +628,35 @@ func diff(cur, prev uint64) uint64 {
 	return cur - prev
 }
 
+// syncAppliedActiveMirror updates appliedActiveNeighbor/appliedActiveComposite
+// for every prefix touched by u, an actuate.NeighborTierUpdate that was just
+// confirmed applied (dampener-allowed, SetNeighborTiers succeeded). A prefix
+// gains a mirror entry for u.Neighbor when u assigns it topTier, or when
+// u.Neighbor is that prefix's only candidate this tick -- RankByTier
+// deliberately assigns single-path prefixes defaultTier, never topTier (see
+// rank.go), but a sole candidate is unambiguously "the active path" even at
+// defaultTier, since there's nothing else it could be. If u assigns a prefix
+// some other tier and u.Neighbor was the previously-recorded active neighbor
+// for that prefix, the entry is cleared rather than left pointing at a
+// neighbor that just got demoted. Prefixes u doesn't mention, or where the
+// recorded active neighbor is some other neighbor entirely, are left
+// untouched -- FRR's route-map for those didn't change this tick.
+func syncAppliedActiveMirror(appliedActiveNeighbor map[string]string, appliedActiveComposite map[string]float64,
+	candidateComposite map[string]map[string]float64, u actuate.NeighborTierUpdate, topTier int) {
+	for _, pp := range u.Prefs {
+		soleCandidate := len(candidateComposite[pp.Prefix]) == 1
+		if pp.LocalPref == topTier || soleCandidate {
+			appliedActiveNeighbor[pp.Prefix] = u.Neighbor
+			appliedActiveComposite[pp.Prefix] = candidateComposite[pp.Prefix][u.Neighbor]
+		} else if appliedActiveNeighbor[pp.Prefix] == u.Neighbor {
+			delete(appliedActiveNeighbor, pp.Prefix)
+			delete(appliedActiveComposite, pp.Prefix)
+		}
+	}
+}
+
 // uint32ToIPStr converts the uint32 stored in BPF path_key to a dotted-quad.
-// ponytail: assumes host byte order per bpf/common.h:9, but egress_sockops.bpf.c:81
-// stores network order on some kernels -- known gap, centralized here so the
-// fix is one swap. Ceiling: wrong order on affected kernels; upgrade path is
-// bpf_ntohl at the BPF writer or a swap here.
+// ponytail: assumes host byte order per bpf/common.h:9.
 // F5 trip-wire: TestUint32ToIPStr_RoundTrip asserts current behavior; a future
 // BPF-side fix will make this test fail, signaling the conversion needs updating.
 func uint32ToIPStr(v uint32) string {

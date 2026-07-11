@@ -1,9 +1,18 @@
 #ifndef PATHPROFILER_COMMON_H
 #define PATHPROFILER_COMMON_H
 
+/* LPM trie key for dst_to_nexthop lookups. prefixlen=32 means
+ * exact-match a /32 destination; the daemon populates entries at
+ * the prefix granularity (e.g. /24) so one entry covers the whole
+ * subnet. */
+struct lpm_key {
+	__u32 prefixlen;
+	__u32 daddr;   /* host byte order */
+};
+
 /* Keyed by resolved next-hop, not by full flow — one entry per candidate
- * gateway path. next_hop_ip is resolved by looking up the dst_to_nexthop
- * map (populated by userspace via `ip route get` sweeps).
+ * gateway path. next_hop_ip is the resolved gateway (populated by the
+ * daemon via ip route get sweeps into dst_to_nexthop).
  */
 struct path_key {
 	__u32 next_hop_ip;   /* IPv4 next-hop, host byte order */
@@ -28,6 +37,15 @@ struct ingress_stats {
 	__u64 packets;
 	__u64 last_seq_seen;   /* only meaningful for TCP flows we're tracking */
 	__u64 seq_gaps;        /* coarse proxy for ingress loss; NOT a substitute for real loss accounting */
+};
+
+/* Transit-side (forwarded traffic) stats, updated from TC egress hook.
+ * Keyed by path_key like egress_stats, but sourced from forwarded packets,
+ * not locally-terminated TCP sockets. */
+struct transit_stats {
+	__u64 segments;       /* TCP segments forwarded through this path */
+	__u64 retransmits;    /* retransmits detected via Bloom seq filter */
+	__u64 last_update_ns;
 };
 
 #endif

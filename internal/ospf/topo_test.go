@@ -48,8 +48,8 @@ func TestParseRoute_10_255_0_3(t *testing.T) {
 	if p.Interface != "wg0" {
 		t.Errorf("Interface = %q, want wg0", p.Interface)
 	}
-	if p.PhysicalNH != "192.168.200.3" {
-		t.Errorf("PhysicalNH = %q, want 192.168.200.3", p.PhysicalNH)
+	if p.GatewayIP != "192.168.200.3" {
+		t.Errorf("GatewayIP = %q, want 192.168.200.3", p.GatewayIP)
 	}
 	if p.Cost != 60 {
 		t.Errorf("Cost = %d, want 60", p.Cost)
@@ -71,8 +71,8 @@ func TestParseRoute_10_255_0_4(t *testing.T) {
 	if paths[0].Interface != "wg0" {
 		t.Errorf("Interface = %q, want wg0", paths[0].Interface)
 	}
-	if paths[0].PhysicalNH != "192.168.200.4" {
-		t.Errorf("PhysicalNH = %q, want 192.168.200.4", paths[0].PhysicalNH)
+	if paths[0].GatewayIP != "192.168.200.4" {
+		t.Errorf("GatewayIP = %q, want 192.168.200.4", paths[0].GatewayIP)
 	}
 	if paths[0].Cost != 60 {
 		t.Errorf("Cost = %d, want 60", paths[0].Cost)
@@ -102,8 +102,8 @@ func TestParseRoute_10_255_0_6(t *testing.T) {
 	if paths[0].Interface != "ens21" {
 		t.Errorf("Interface = %q, want ens21", paths[0].Interface)
 	}
-	if paths[0].PhysicalNH != "192.168.100.6" {
-		t.Errorf("PhysicalNH = %q, want 192.168.100.6", paths[0].PhysicalNH)
+	if paths[0].GatewayIP != "192.168.100.6" {
+		t.Errorf("GatewayIP = %q, want 192.168.100.6", paths[0].GatewayIP)
 	}
 	if paths[0].Cost != 20 {
 		t.Errorf("Cost = %d, want 20", paths[0].Cost)
@@ -195,7 +195,7 @@ func TestFetchTopo_VtyshError(t *testing.T) {
 	}
 }
 
-func TestLoopbackForPhysicalNH_Found(t *testing.T) {
+func TestLoopbackForGateway_Found(t *testing.T) {
 	routeData := readFixture(t, fixtureRoute)
 	paths3, _ := ParseRoute(routeData, "10.255.0.3")
 	paths4, _ := ParseRoute(routeData, "10.255.0.4")
@@ -204,45 +204,45 @@ func TestLoopbackForPhysicalNH_Found(t *testing.T) {
 		"10.255.0.4": paths4,
 	}
 
-	loopback, err := u.LoopbackForPhysicalNH("192.168.200.3")
+	loopback, err := u.LoopbackForGateway("192.168.200.3")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if loopback != "10.255.0.3" {
-		t.Errorf("LoopbackForPhysicalNH(192.168.200.3) = %q, want 10.255.0.3", loopback)
+		t.Errorf("LoopbackForGateway(192.168.200.3) = %q, want 10.255.0.3", loopback)
 	}
 
-	loopback, err = u.LoopbackForPhysicalNH("192.168.200.4")
+	loopback, err = u.LoopbackForGateway("192.168.200.4")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if loopback != "10.255.0.4" {
-		t.Errorf("LoopbackForPhysicalNH(192.168.200.4) = %q, want 10.255.0.4", loopback)
+		t.Errorf("LoopbackForGateway(192.168.200.4) = %q, want 10.255.0.4", loopback)
 	}
 }
 
-func TestLoopbackForPhysicalNH_NotFound(t *testing.T) {
+func TestLoopbackForGateway_NotFound(t *testing.T) {
 	u := Underlay{
-		"10.255.0.3": {{PhysicalNH: "192.168.200.3"}},
+		"10.255.0.3": {{GatewayIP: "192.168.200.3"}},
 	}
-	loopback, err := u.LoopbackForPhysicalNH("192.168.99.99")
+	loopback, err := u.LoopbackForGateway("192.168.99.99")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if loopback != "" {
-		t.Errorf("expected empty for unknown physical NH, got %q", loopback)
+		t.Errorf("expected empty for unknown gateway IP, got %q", loopback)
 	}
 }
 
-func TestLoopbackForPhysicalNH_AmbiguousReturnsError(t *testing.T) {
-	// Two loopbacks reachable via the same physical NH — violates uniqueness.
+func TestLoopbackForGateway_AmbiguousReturnsError(t *testing.T) {
+	// Two loopbacks reachable via the same gateway IP — violates uniqueness.
 	u := Underlay{
-		"10.255.0.3": {{PhysicalNH: "192.168.200.3", Interface: "wg0"}},
-		"10.255.0.4": {{PhysicalNH: "192.168.200.3", Interface: "ens21"}},
+		"10.255.0.3": {{GatewayIP: "192.168.200.3", Interface: "wg0"}},
+		"10.255.0.4": {{GatewayIP: "192.168.200.3", Interface: "ens21"}},
 	}
-	loopback, err := u.LoopbackForPhysicalNH("192.168.200.3")
+	loopback, err := u.LoopbackForGateway("192.168.200.3")
 	if err == nil {
-		t.Fatalf("expected error for ambiguous physical NH, got loopback %q", loopback)
+		t.Fatalf("expected error for ambiguous gateway IP, got loopback %q", loopback)
 	}
 	if loopback != "" {
 		t.Errorf("expected empty loopback on error, got %q", loopback)

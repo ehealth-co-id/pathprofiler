@@ -20,14 +20,16 @@ import (
 )
 
 type PathCost struct {
-	NextHopIP       uint32
-	Neighbor        string  // BGP advertising peer IP (loopback for RR clients); set by caller after Compute
-	EgressRTTUs     float64
-	EgressLossRate  float64 // retransmits per byte-ish proxy; see caveat below
-	IngressJitterUs float64
-	IngressGapRate  float64
-	Composite       float64
-	Confidence      float64 // 0..1, based on sample count -- low-sample paths should not win on noise
+	NextHopIP                uint32
+	Neighbor                 string   // BGP advertising peer IP (loopback for RR clients); set by caller after Compute
+	EgressRTTUs              float64
+	EgressLossRate           float64 // retransmits per byte-ish proxy; see caveat below
+	EgressLossRateOverride   *float64 // non-nil: use this rate directly, skip retransDelta/bytesDelta division
+	IngressJitterUs          float64
+	IngressGapRate           float64
+	Composite                float64
+	CompositeErr             float64 // error band on Composite (0.0 for passive paths with high sample counts)
+	Confidence               float64 // 0..1, based on sample count -- low-sample paths should not win on noise
 }
 
 type Weights struct {
@@ -100,10 +102,21 @@ func Compute(nextHop uint32,
 		EgressLossRate:  lossRate,
 		IngressJitterUs: jitterUs,
 		IngressGapRate:  gapRate,
+		CompositeErr:    0.0, // passive paths have negligible measurement uncertainty
 		Confidence:      confidence,
 	}
 	res.Composite = composite(res, w)
 	return res
+}
+
+// RecomputeComposite recalculates the Composite score, optionally using
+// EgressLossRateOverride if set. Call after setting EgressLossRateOverride
+// on a PathCost returned by Compute or FromProbeResult.
+func (pc *PathCost) RecomputeComposite(w Weights) {
+	if pc.EgressLossRateOverride != nil {
+		pc.EgressLossRate = *pc.EgressLossRateOverride
+	}
+	pc.Composite = composite(*pc, w)
 }
 
 // composite computes the weighted cost from a PathCost's component fields.
@@ -116,22 +129,40 @@ func composite(pc PathCost, w Weights) float64 {
 		w.IngressGap*pc.IngressGapRate
 }
 
-// FromProbeResult builds a PathCost from a single cold-path probe.
-// RTT -> EgressRTTUs (underlay-only, not end-to-end); Lost -> sentinel
-// EgressLossRate 1.0; ingress fields zero; Confidence = 0 (cold-probe taint).
+// FromProbeResult builds a PathCost from a cold-path probe burst.
+// RTT -> EgressRTTUs (underlay-only, not end-to-end); LossRate -> graded
+// EgressLossRate; CompositeErr propagated from Wilson interval semi-width
+// scaled by loss weight. Sentinel reserved for lossRate >= 1.0 only.
+// Confidence = 0 (cold-probe taint).
 //
 // Confidence=0 marks the entry as underlay-scale so (a) RankByTier demotes
 // cold-only neighbors via the existing Confidence < 0.5 -> defaultTier rule,
 // and (b) CollapseByNeighbor drops it when a passive path for the same
 // neighbor exists, avoiding RTT scale mismatch in the averaged metric.
-func FromProbeResult(nextHop uint32, rtt time.Duration, lost bool) PathCost {
-	pc := PathCost{NextHopIP: nextHop, Confidence: 0}
-	if lost {
-		pc.EgressLossRate = 1.0
+//
+// ponytail: graded composite for partial loss makes the cold prober meaningful
+// for sub-100% loss; sentinel reserved for total loss only. CompositeErr
+// propagates the binomial measurement uncertainty scaled by the loss weight.
+func FromProbeResult(nextHop uint32, rtt time.Duration, lossRate, lossRateErr float64) PathCost {
+	pc := PathCost{NextHopIP: nextHop, Confidence: 0, EgressLossRate: lossRate}
+	pc.CompositeErr = DefaultWeights.EgressLoss * lossRateErr
+	if lossRate >= 1.0 {
 		pc.Composite = lostProbeComposite // sentinel: always worse than any measured path
+		pc.CompositeErr = 0               // sentinel has no error
 	} else {
 		pc.EgressRTTUs = float64(rtt.Microseconds())
 		pc.Composite = composite(pc, DefaultWeights)
 	}
 	return pc
+}
+
+// ConfidenceFromSamples maps a sample count to a 0..1 confidence using the
+// same threshold as Compute: <5 samples => samples/5, >=5 => 1.0.
+// Used to give transit-overridden cold probes a real Confidence so
+// RankByTier's Confidence>=0.5 gate can promote them above defaultTier.
+func ConfidenceFromSamples(samples uint64) float64 {
+	if samples < 5 {
+		return float64(samples) / 5.0
+	}
+	return 1.0
 }

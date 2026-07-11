@@ -44,7 +44,7 @@ var runVtysh = func(script string) ([]byte, error) {
 }
 
 type Dampener struct {
-	lastSwitch map[string]time.Time // keyed by "subnet->interface" or similar route identity
+	lastSwitch map[string]time.Time // keyed by "neighbor-IP" (one entry per BGP peer)
 	minDwell   time.Duration
 }
 
@@ -114,10 +114,16 @@ func SetNeighborTiers(u NeighborTierUpdate) error {
 	// route-map, matching the neighbor-atomic actuation unit.
 	fmt.Fprintf(&b, "no route-map PATHPROFILER-%s\n", neighborSlug)
 
-	// Declare prefix-lists for each in-scope prefix.
+	// Declare prefix-lists for each in-scope prefix. Fixed seq 5: this list
+	// is shared across every neighbor route-map that matches the same scope
+	// prefix, so each neighbor's SetNeighborTiers call re-declares it every
+	// tick. Without an explicit seq, FRR auto-assigns the next free one on
+	// each re-declaration instead of recognizing an identical entry already
+	// exists, piling up duplicate seq 5/10/15/... entries with identical
+	// content. Pinning seq 5 makes the re-declaration idempotent.
 	for _, pp := range u.Prefs {
 		prefixSlug := sanitizeRouteMapName(pp.Prefix)
-		fmt.Fprintf(&b, "ip prefix-list PATHPROFILER-SCOPE-%s permit %s\n", prefixSlug, pp.Prefix)
+		fmt.Fprintf(&b, "ip prefix-list PATHPROFILER-SCOPE-%s seq 5 permit %s\n", prefixSlug, pp.Prefix)
 	}
 
 	// Build the per-neighbor route-map: one permit seq per prefix, plus
@@ -180,7 +186,15 @@ func RemoveNeighborTiers(neighbor string) error {
 	slug := sanitizeRouteMapName(neighbor)
 	var b strings.Builder
 	b.WriteString("configure terminal\n")
+	// `no neighbor ... route-map ... in` is only valid inside `router bgp`,
+	// not at the top level of configure terminal (contrast the plain
+	// `neighbor ... route-map ... in` form used elsewhere — that one also
+	// belongs in router bgp; SetNeighborTiers enters it for the same
+	// reason). Issuing it at the top level makes vtysh exit 1 on the
+	// command, so the subsequent `no route-map` never runs.
+	b.WriteString("router bgp\n")
 	fmt.Fprintf(&b, "no neighbor %s route-map PATHPROFILER-%s in\n", neighbor, slug)
+	b.WriteString("exit\n")
 	fmt.Fprintf(&b, "no route-map PATHPROFILER-%s\n", slug)
 	b.WriteString("exit\n")
 	_, err := runVtysh(b.String())

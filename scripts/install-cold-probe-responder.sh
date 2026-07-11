@@ -2,30 +2,35 @@
 set -euo pipefail
 
 usage() {
-    echo "Usage: $0 [--version VERSION]"
+    echo "Usage: $0 [--version VERSION] [--port PORT]"
     echo ""
-    echo "Install pathprofiler from a GitHub release."
+    echo "Install the pathprofiler cold-probe responder from a GitHub release."
+    echo "Standalone binary: no BPF toolchain, no root capabilities, no FRR access."
     echo ""
     echo "  --version VERSION    Specific version to install (e.g. v1.0.0)."
     echo "                       If omitted, installs the latest release."
+    echo "  --port PORT          UDP port to listen on (default: 33434)."
     exit 1
 }
 
 # Configuration
 REPO="ehealth-co-id/pathprofiler"
-SERVICE_NAME="pathprofiler"
+SERVICE_NAME="pathprofiler-responder"
 INSTALL_DIR="/opt/pathprofiler"
-BIN_NAME="pathprofiler-daemon"
-CONFIG_FILE="/etc/pathprofiler.yaml"
+BIN_NAME="pathprofiler-responder"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
-APPARMOR_FILE="/etc/apparmor.d/opt.pathprofiler.pathprofiler-daemon"
 RELEASE_BASE="https://github.com/${REPO}/releases/download"
 
 VERSION=""
+PORT="33434"
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --version)
             VERSION="$2"
+            shift 2
+            ;;
+        --port)
+            PORT="$2"
             shift 2
             ;;
         -h|--help)
@@ -53,7 +58,7 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
-for cmd in curl sha256sum systemctl; do
+for cmd in curl sha256sum systemctl sed; do
     if ! command -v "$cmd" >/dev/null 2>&1; then
         echo "ERROR: Required command not found: $cmd"
         exit 1
@@ -85,22 +90,18 @@ fi
 TAG=$(echo "$RELEASE_JSON" | grep -o '"tag_name": *"[^"]*"' | cut -d'"' -f4)
 BASE_URL="${RELEASE_BASE}/${TAG}"
 
-BINARY_URL="${BASE_URL}/pathprofiler-daemon-linux-${ARCH}"
+BINARY_URL="${BASE_URL}/pathprofiler-responder-linux-${ARCH}"
 CHECKSUM_URL="${BASE_URL}/SHA256SUMS"
-SERVICE_URL="${BASE_URL}/pathprofiler.service"
-APPARMOR_URL="${BASE_URL}/pathprofiler.apparmor"
-CONFIG_URL="${BASE_URL}/pathprofiler.yaml.example"
+SERVICE_URL="${BASE_URL}/pathprofiler-responder.service"
 
-RELEASE_BIN="pathprofiler-daemon-linux-${ARCH}"
+RELEASE_BIN="pathprofiler-responder-linux-${ARCH}"
 
 echo "[*] Downloading release assets..."
 TMP_DIR=$(mktemp -d)
 cd "$TMP_DIR"
 curl -fsSL -o "${RELEASE_BIN}" "$BINARY_URL"
 curl -fsSL -o SHA256SUMS "$CHECKSUM_URL"
-curl -fsSL -o pathprofiler.service "$SERVICE_URL"
-curl -fsSL -o pathprofiler.apparmor "$APPARMOR_URL"
-curl -fsSL -o pathprofiler.yaml.example "$CONFIG_URL"
+curl -fsSL -o pathprofiler-responder.service "$SERVICE_URL"
 
 # 3. Verify checksum (--ignore-missing skips entries for other arch not downloaded)
 echo "[*] Verifying checksum..."
@@ -115,34 +116,12 @@ echo "[*] Installing binary to ${INSTALL_DIR}/..."
 mkdir -p "$INSTALL_DIR"
 install -m 0755 "${RELEASE_BIN}" "${INSTALL_DIR}/${BIN_NAME}"
 
-# 5. Install example config (don't overwrite existing)
-if [[ ! -f "$CONFIG_FILE" ]]; then
-    echo "[*] Installing example config to ${CONFIG_FILE}..."
-    install -m 0644 -o root -g root "${TMP_DIR}/pathprofiler.yaml.example" "$CONFIG_FILE"
-else
-    echo "[*] Config ${CONFIG_FILE} already exists, leaving it intact"
-fi
+# 5. Install systemd unit, patching the port if non-default
+echo "[*] Installing systemd service unit (port ${PORT})..."
+sed -i "s/--port [0-9]\+/--port ${PORT}/" "${TMP_DIR}/pathprofiler-responder.service"
+install -m 0644 "${TMP_DIR}/pathprofiler-responder.service" "$SERVICE_FILE"
 
-# 6. Install systemd unit
-echo "[*] Installing systemd service unit..."
-install -m 0644 "${TMP_DIR}/pathprofiler.service" "$SERVICE_FILE"
-
-# 7. Install and reload AppArmor profile
-echo "[*] Installing AppArmor profile..."
-install -m 0644 "${TMP_DIR}/pathprofiler.apparmor" "$APPARMOR_FILE"
-if command -v apparmor_parser >/dev/null 2>&1; then
-    # Fail loudly on parse/reload errors — a silently-failed reload leaves the
-    # kernel enforcing the previous profile, which is how a stale DENIED can
-    # persist long after the rule was "fixed" on disk.
-    if ! apparmor_parser -r "$APPARMOR_FILE"; then
-        echo "ERROR: AppArmor profile failed to load. The kernel is still"
-        echo "       enforcing the previous profile. Fix the profile and rerun:"
-        echo "         apparmor_parser -r $APPARMOR_FILE"
-        exit 1
-    fi
-fi
-
-# 8. Enable and start
+# 6. Enable and start
 echo "[*] Reloading systemd and enabling service..."
 systemctl daemon-reload
 systemctl enable "${SERVICE_NAME}"
@@ -158,6 +137,6 @@ echo ""
 echo "    status:  systemctl status ${SERVICE_NAME}"
 echo "    logs:    journalctl -u ${SERVICE_NAME} -f"
 echo ""
-echo "    NOTE: The daemon loads BPF programs at startup and pins maps to"
-echo "    /sys/fs/bpf/pathprofiler/. Requires CAP_BPF + CAP_NET_ADMIN"
-echo "    (granted by the systemd unit via AmbientCapabilities)."
+echo "    NOTE: Runs as an unprivileged DynamicUser -- no BPF, no FRR access,"
+echo "    no root capabilities. It only listens on UDP :${PORT} and echoes"
+echo "    back cold-probe payloads from pathprofiler-daemon instances."

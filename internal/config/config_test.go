@@ -88,9 +88,54 @@ func TestDefaultsApplied(t *testing.T) {
 	if cfg.Probe.IntervalSeconds != 60 {
 		t.Errorf("default Probe.IntervalSeconds = %d, want 60", cfg.Probe.IntervalSeconds)
 	}
+	if cfg.Probe.EMAHalfLifeSeconds != 300 {
+		t.Errorf("default Probe.EMAHalfLifeSeconds = %d, want 300", cfg.Probe.EMAHalfLifeSeconds)
+	}
+	if cfg.Probe.TimeoutRTTMultiplier != 8.0 {
+		t.Errorf("default Probe.TimeoutRTTMultiplier = %f, want 8.0", cfg.Probe.TimeoutRTTMultiplier)
+	}
+	if cfg.Probe.MinTimeoutMs != 20 {
+		t.Errorf("default Probe.MinTimeoutMs = %d, want 20", cfg.Probe.MinTimeoutMs)
+	}
 	// Scope should be empty (nil).
 	if len(cfg.Scope.Prefixes) != 0 {
 		t.Errorf("expected empty scope prefixes, got %v", cfg.Scope.Prefixes)
+	}
+}
+
+func TestValidateProbeEMAHalfLifeNegative(t *testing.T) {
+	yamlContent := []byte(`
+probe:
+  ema_half_life_seconds: -1
+`)
+	path := writeTempYAML(t, yamlContent)
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected error for negative ema_half_life_seconds, got nil")
+	}
+}
+
+func TestValidateProbeTimeoutRTTMultiplierNegative(t *testing.T) {
+	yamlContent := []byte(`
+probe:
+  timeout_rtt_multiplier: -1
+`)
+	path := writeTempYAML(t, yamlContent)
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected error for negative timeout_rtt_multiplier, got nil")
+	}
+}
+
+func TestValidateProbeMinTimeoutMsNegative(t *testing.T) {
+	yamlContent := []byte(`
+probe:
+  min_timeout_ms: -1
+`)
+	path := writeTempYAML(t, yamlContent)
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected error for negative min_timeout_ms, got nil")
 	}
 }
 

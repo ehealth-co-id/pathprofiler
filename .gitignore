@@ -3,3 +3,4 @@ bin/
 bpf/*.bpf.o
 internal/loader/*.bpf.o
 bpf/vmlinux.h
+daemon
