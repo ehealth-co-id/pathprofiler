@@ -53,12 +53,67 @@ type IfaceAttach struct {
 // Loader holds loaded BPF collections and attached links.
 // Call Close to detach programs and release resources.
 type Loader struct {
-	ingressColl      *ebpf.Collection
-	transitColl      *ebpf.Collection
-	links            []link.Link
-	tcLinks          []tcLink // TC attachments (TCX or clsact), cleaned up separately
-	attachedIfaces   map[string]bool  // tracks XDP-attached interfaces
-	tcAttachedIfaces map[string]bool  // tracks TC-attached interfaces
+	ingressColl *ebpf.Collection
+	transitColl *ebpf.Collection
+	links       []xdpAttach // XDP attachments we created, for Close
+	tcLinks     []tcLink    // TC attachments (clsact), cleaned up separately
+	// attachedIfaces/tcAttachedIfaces record what we believe is attached, keyed
+	// by interface name, together with the ifindex it was attached against.
+	// They are a record, NOT the decision: presence is verified against the
+	// kernel on every attach attempt, because an interface that is recreated
+	// (e.g. `wg-quick down/up`) comes back with a new ifindex and the kernel has
+	// already destroyed our programs with the old interface.
+	attachedIfaces   map[string]ifaceAttach
+	tcAttachedIfaces map[string]ifaceAttach
+}
+
+// ifaceAttach is one recorded attachment.
+type ifaceAttach struct {
+	ifindex int  // interface index the attachment was made against
+	ours    bool // false: something is attached but it is not ours
+}
+
+// xdpAttach is one XDP link we created, tagged so a stale one can be dropped
+// when its interface is recreated.
+type xdpAttach struct {
+	iface   string
+	ifindex int
+	lnk     link.Link
+}
+
+// dropStaleXDP forgets (and best-effort closes) the XDP link recorded for an
+// interface whose attachment no longer exists in the kernel.
+func (l *Loader) dropStaleXDP(iface string) {
+	kept := l.links[:0]
+	for _, a := range l.links {
+		if a.iface == iface {
+			if a.lnk != nil {
+				a.lnk.Close() // stale handle: the kernel already dropped the program
+			}
+			continue
+		}
+		kept = append(kept, a)
+	}
+	l.links = kept
+}
+
+// dropStaleTC forgets (and best-effort closes) the TC links recorded for an
+// interface whose filter no longer exists in the kernel.
+func (l *Loader) dropStaleTC(iface string) {
+	kept := l.tcLinks[:0]
+	for _, tl := range l.tcLinks {
+		if tl.iface == iface {
+			if tl.link != nil {
+				tl.link.Close()
+			}
+			if tl.clsact != nil {
+				tl.clsact.Close()
+			}
+			continue
+		}
+		kept = append(kept, tl)
+	}
+	l.tcLinks = kept
 }
 
 // tcLink wraps a single TC attachment — either TCX (link.Link) or clsact fallback.
@@ -73,7 +128,7 @@ type tcLink struct {
 // AttachXDP is called separately so it can be retried when gateway interfaces
 // become available.
 func Load() (*Loader, error) {
-	l := &Loader{attachedIfaces: make(map[string]bool), tcAttachedIfaces: make(map[string]bool)}
+	l := &Loader{attachedIfaces: make(map[string]ifaceAttach), tcAttachedIfaces: make(map[string]ifaceAttach)}
 
 	if err := os.MkdirAll(defaultPinDir, 0o755); err != nil {
 		return nil, fmt.Errorf("create pin dir %s: %w", defaultPinDir, err)
@@ -105,30 +160,54 @@ func Load() (*Loader, error) {
 }
 
 // AttachXDP attaches the ingress XDP program to the given interfaces.
-// Idempotent: skips interfaces already attached. Called at startup if
-// discoverGatewayIfaces succeeded, or retried in the loop once underlay
-// data is available.
+//
+// Presence is verified against the kernel instead of trusted from memory: the
+// attach is attempted with XDP_FLAGS_UPDATE_IF_NOEXIST, so
+//
+//   - success -> we attached, or re-attached after the interface was recreated
+//     (recreating an interface destroys the program with it, which is precisely
+//     the case an in-memory "already attached" flag got wrong);
+//   - EBUSY   -> something is already attached. If our record is for this same
+//     ifindex it is ours and this is the steady state; otherwise another tool
+//     owns XDP on this interface and we leave it alone rather than displacing
+//     it (XDP allows only one program per interface without multiprog).
+//
+// Called at startup if discoverGatewayIfaces succeeded, and re-called on every
+// topology refresh.
 func (l *Loader) AttachXDP(ifaces []IfaceAttach) {
 	for _, iface := range ifaces {
-		if l.attachedIfaces[iface.Iface] {
-			continue
-		}
 		ifIdx, err := net.InterfaceByName(iface.Iface)
 		if err != nil {
 			log.Printf("loader: XDP skip %s: %v", iface.Iface, err)
 			continue
 		}
-		xdpLink, err := link.AttachXDP(link.XDPOptions{
+		prev, known := l.attachedIfaces[iface.Iface]
+		lnk, err := link.AttachXDP(link.XDPOptions{
 			Program:   l.ingressColl.Programs["track_ingress"],
 			Interface: ifIdx.Index,
+			Flags:     link.XDPAttachFlags(unix.XDP_FLAGS_UPDATE_IF_NOEXIST),
 		})
-		if err != nil {
+		switch {
+		case err == nil:
+			l.dropStaleXDP(iface.Iface)
+			l.links = append(l.links, xdpAttach{iface: iface.Iface, ifindex: ifIdx.Index, lnk: lnk})
+			l.attachedIfaces[iface.Iface] = ifaceAttach{ifindex: ifIdx.Index, ours: true}
+			if known {
+				log.Printf("loader: XDP re-attached to %s (previous attachment gone; ifindex %d -> %d)",
+					iface.Iface, prev.ifindex, ifIdx.Index)
+			} else {
+				log.Printf("loader: XDP attached to %s", iface.Iface)
+			}
+		case errors.Is(err, unix.EBUSY):
+			if known && prev.ifindex == ifIdx.Index {
+				continue // ours, still attached: the steady state
+			}
+			l.attachedIfaces[iface.Iface] = ifaceAttach{ifindex: ifIdx.Index, ours: false}
+			log.Printf("loader: XDP on %s already attached by another program (idx %d) — leaving it in place",
+				iface.Iface, ifIdx.Index)
+		default:
 			log.Printf("loader: XDP attach %s (idx %d): %v (non-fatal)", iface.Iface, ifIdx.Index, err)
-			continue
 		}
-		l.links = append(l.links, xdpLink)
-		l.attachedIfaces[iface.Iface] = true
-		log.Printf("loader: XDP attached to %s", iface.Iface)
 	}
 }
 
@@ -156,8 +235,10 @@ func (l *Loader) loadIngress() error {
 
 // Close detaches all programs and closes all collections.
 func (l *Loader) Close() {
-	for _, lnk := range l.links {
-		lnk.Close()
+	for _, a := range l.links {
+		if a.lnk != nil {
+			a.lnk.Close()
+		}
 	}
 	l.links = nil
 	for _, tl := range l.tcLinks {
@@ -222,24 +303,83 @@ func (l *Loader) loadTransit() error {
 	return nil
 }
 
-// AttachTC attaches the transit_egress TC program to the given interfaces
-// via clsact (netlink BpfFilter). clsact supports multiple filters per
-// interface so both pathprofiler and ebpf-packet-loss-exporter can coexist.
-// Idempotent: skips interfaces already attached.
+// AttachTC attaches the transit_egress TC program to the given interfaces via
+// clsact (netlink BpfFilter). clsact supports multiple filters per interface
+// so both pathprofiler and ebpf-packet-loss-exporter can coexist.
+//
+// Presence is verified against the kernel — a clsact egress filter named
+// transit_egress on the interface's *current* ifindex — rather than an
+// in-memory flag. That matters because recreating an interface (e.g.
+// `wg-quick down/up`) destroys its filters while the in-memory flag keeps
+// saying "attached", which silently leaves the interface unmonitored until the
+// daemon is restarted. Verifying also covers the reverse case: our filter
+// being removed by something else.
 func (l *Loader) AttachTC(ifaces []string) error {
 	for _, iface := range ifaces {
-		if l.tcAttachedIfaces[iface] {
+		ifIdx, err := net.InterfaceByName(iface)
+		if err != nil {
+			return fmt.Errorf("interface %q: %w", iface, err)
+		}
+		present, err := clsActHasOurs(ifIdx.Index)
+		if err != nil {
+			return fmt.Errorf("inspect clsact on %s: %w", iface, err)
+		}
+		prev, known := l.tcAttachedIfaces[iface]
+		if present {
+			if !known {
+				log.Printf("loader: TC egress already present on %s (idx %d) — adopting it", iface, ifIdx.Index)
+			}
+			l.tcAttachedIfaces[iface] = ifaceAttach{ifindex: ifIdx.Index, ours: true}
 			continue
 		}
+		// Absent: never attached, or the kernel dropped it with a recreated
+		// interface. Forget the stale record and attach afresh.
+		l.dropStaleTC(iface)
 		a, err := attachClsActEgress(iface, l.transitColl.Programs["transit_egress"])
 		if err != nil {
 			return fmt.Errorf("attach TC egress on %s: %w", iface, err)
 		}
 		l.tcLinks = append(l.tcLinks, a)
-		l.tcAttachedIfaces[iface] = true
-		log.Printf("loader: TC egress attached to %s", iface)
+		l.tcAttachedIfaces[iface] = ifaceAttach{ifindex: ifIdx.Index, ours: true}
+		if known {
+			log.Printf("loader: TC egress re-attached to %s (previous attachment gone; ifindex %d -> %d)",
+				iface, prev.ifindex, ifIdx.Index)
+		} else {
+			log.Printf("loader: TC egress attached to %s", iface)
+		}
 	}
 	return nil
+}
+
+// clsActHasOurs reports whether a clsact egress filter running our
+// transit_egress program is already attached to the interface.
+func clsActHasOurs(ifindex int) (bool, error) {
+	nl, err := netlink.LinkByIndex(ifindex)
+	if err != nil {
+		return false, fmt.Errorf("netlink lookup: %w", err)
+	}
+	filters, err := netlink.FilterList(nl, uint32(netlink.HANDLE_MIN_EGRESS))
+	if err != nil {
+		return false, err
+	}
+	for _, f := range filters {
+		if isOurs(f) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// isOurs reports whether a netlink filter is one of ours. The kernel truncates
+// filter names to 15 characters, so match on the prefix. This single rule is
+// what keeps us from touching other tools' filters — e.g.
+// ebpf-packet-loss-exporter's "path_egress" sharing the same clsact qdisc.
+func isOurs(f netlink.Filter) bool {
+	bpf, ok := f.(*netlink.BpfFilter)
+	if !ok || bpf == nil {
+		return false
+	}
+	return strings.HasPrefix(bpf.Name, "transit_egress")
 }
 
 // --- TCX / clsact attachment helpers ---
@@ -460,19 +600,13 @@ func detachClsActFilters(iface net.Interface) error {
 		return err
 	}
 	for _, f := range filters {
-		bpf, ok := f.(*netlink.BpfFilter)
-		if !ok {
+		if !isOurs(f) {
 			continue
 		}
-		name := bpf.Name
-		// ponytail: name is truncated to 15 chars by the kernel, so we
-		// check prefix instead of exact match.
-		if strings.HasPrefix(name, "transit_egress") {
-			if err := netlink.FilterDel(f); err != nil {
-				log.Printf("loader: DetachStaleTC: delete filter %s on %s: %v", name, iface.Name, err)
-			} else {
-				log.Printf("loader: DetachStaleTC: removed stale filter %s on %s", name, iface.Name)
-			}
+		if err := netlink.FilterDel(f); err != nil {
+			log.Printf("loader: DetachStaleTC: delete filter handle %#x on %s: %v", f.Attrs().Handle, iface.Name, err)
+		} else {
+			log.Printf("loader: DetachStaleTC: removed stale filter handle %#x on %s", f.Attrs().Handle, iface.Name)
 		}
 	}
 	return nil

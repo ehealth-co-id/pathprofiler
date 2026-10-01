@@ -1,5 +1,29 @@
 # Changelog
 
+## v0.0.6
+
+- **Attach state is verified against the kernel, not remembered.** The loader
+  tracked XDP/TC presence in in-memory maps and skipped anything it believed was
+  attached. Recreating an interface — `wg-quick down/up` on `wg0`, for instance —
+  destroys the programs together with it while the map keeps saying "attached",
+  so that interface stayed **silently unmonitored until the daemon was
+  restarted**. Observed live on `e`: pathprofiler logged `TC attached to 2
+  interfaces: [wg0 eth3]` while `bpftool net` showed no `transit_egress` on
+  `wg0` at all. Now:
+  - TC presence is checked each topology refresh by looking up a clsact-egress
+    filter running our own `transit_egress` program on the interface's current
+    ifindex (which also catches our filter being removed by something else);
+  - XDP is attached with `XDP_FLAGS_UPDATE_IF_NOEXIST`: success means we
+    attached (or re-attached after a recreation), while `EBUSY` means another
+    tool already owns XDP on that interface and we leave it in place — the
+    previous flagless attach silently displaced whatever was there, which is
+    how pathprofiler and ebpf-packet-loss-exporter were fighting over XDP;
+  - attachment records carry the ifindex, so a recreated interface is detected
+    and its stale link handles are dropped rather than leaked;
+  - re-attachment is logged explicitly (`previous attachment gone; ifindex N -> M`).
+  Tests: `isOurs` (the coexistence rule — recognize our filter, never another
+  tool's) and the stale-record pruning.
+
 ## v0.0.5
 
 - **Denser, quieter daemon logging.** The control loop logged per item *per
