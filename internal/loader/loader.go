@@ -162,15 +162,22 @@ func Load() (*Loader, error) {
 // AttachXDP attaches the ingress XDP program to the given interfaces.
 //
 // Presence is verified against the kernel instead of trusted from memory: the
-// attach is attempted with XDP_FLAGS_UPDATE_IF_NOEXIST, so
+// attach is attempted every refresh, so
 //
 //   - success -> we attached, or re-attached after the interface was recreated
-//     (recreating an interface destroys the program with it, which is precisely
+//     (recreating an interface destroys the program with it, which is exactly
 //     the case an in-memory "already attached" flag got wrong);
 //   - EBUSY   -> something is already attached. If our record is for this same
-//     ifindex it is ours and this is the steady state; otherwise another tool
-//     owns XDP on this interface and we leave it alone rather than displacing
-//     it (XDP allows only one program per interface without multiprog).
+//     ifindex it is ours and this is the steady state; otherwise it belongs to
+//     another tool (or to a previous process that was killed before it could
+//     detach) and we leave it alone.
+//
+// Note on flags: this goes through the bpf_link API, which accepts only the
+// XDP *mode* bits — passing XDP_FLAGS_UPDATE_IF_NOEXIST here fails with EINVAL.
+// It is also unnecessary: link-based XDP attach is non-displacing, so an
+// already-occupied mode surfaces as EBUSY rather than being replaced. (The
+// pre-v0.0.5 flagless attach was therefore never displacing other tools; an
+// interface only lost its program when the interface itself was recreated.)
 //
 // Called at startup if discoverGatewayIfaces succeeded, and re-called on every
 // topology refresh.
@@ -185,7 +192,6 @@ func (l *Loader) AttachXDP(ifaces []IfaceAttach) {
 		lnk, err := link.AttachXDP(link.XDPOptions{
 			Program:   l.ingressColl.Programs["track_ingress"],
 			Interface: ifIdx.Index,
-			Flags:     link.XDPAttachFlags(unix.XDP_FLAGS_UPDATE_IF_NOEXIST),
 		})
 		switch {
 		case err == nil:
@@ -203,8 +209,8 @@ func (l *Loader) AttachXDP(ifaces []IfaceAttach) {
 				continue // ours, still attached: the steady state
 			}
 			l.attachedIfaces[iface.Iface] = ifaceAttach{ifindex: ifIdx.Index, ours: false}
-			log.Printf("loader: XDP on %s already attached by another program (idx %d) — leaving it in place",
-				iface.Iface, ifIdx.Index)
+			log.Printf("loader: XDP on %s already occupied (idx %d) — not attaching over it "+
+				"(another program, or a leftover from a previous process)", iface.Iface, ifIdx.Index)
 		default:
 			log.Printf("loader: XDP attach %s (idx %d): %v (non-fatal)", iface.Iface, ifIdx.Index, err)
 		}

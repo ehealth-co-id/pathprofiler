@@ -1,5 +1,21 @@
 # Changelog
 
+## v0.0.7
+
+- **Fix an XDP attach regression introduced in v0.0.6.** v0.0.6 passed
+  `XDP_FLAGS_UPDATE_IF_NOEXIST` to the XDP attach, which the bpf_link API
+  rejects — it accepts only the XDP *mode* bits — so every attach failed with
+  `create link: invalid argument` and pathprofiler lost ingress XDP coverage on
+  all interfaces. The unit tests could not catch it (only the kernel validates
+  that flag); the acceptance test did: recreate `wg0`, then read `bpftool net`.
+  The flag was also unnecessary, and the v0.0.6 note claiming the previous
+  flagless attach "silently displaced" other programs was wrong: link-based XDP
+  attach is non-displacing, so an occupied mode surfaces as `EBUSY` rather than
+  being replaced, and an interface only lost its program when the interface
+  itself was recreated. The `EBUSY` handling stays (it distinguishes our
+  attachment from someone else's) with wording that no longer claims
+  displacement.
+
 ## v0.0.6
 
 - **Attach state is verified against the kernel, not remembered.** The loader
@@ -13,11 +29,10 @@
   - TC presence is checked each topology refresh by looking up a clsact-egress
     filter running our own `transit_egress` program on the interface's current
     ifindex (which also catches our filter being removed by something else);
-  - XDP is attached with `XDP_FLAGS_UPDATE_IF_NOEXIST`: success means we
-    attached (or re-attached after a recreation), while `EBUSY` means another
-    tool already owns XDP on that interface and we leave it in place — the
-    previous flagless attach silently displaced whatever was there, which is
-    how pathprofiler and ebpf-packet-loss-exporter were fighting over XDP;
+  - XDP is attached every refresh and the outcome is read from the kernel:
+    success means we attached (or re-attached after a recreation), `EBUSY`
+    means the mode is already occupied — ours if the recorded ifindex matches,
+    otherwise another program's — and we do not attach over it;
   - attachment records carry the ifindex, so a recreated interface is detected
     and its stale link handles are dropped rather than leaked;
   - re-attachment is logged explicitly (`previous attachment gone; ifindex N -> M`).
