@@ -1,5 +1,21 @@
 # Changelog
 
+## v0.0.5
+
+- **Denser, quieter daemon logging.** The control loop logged per item *per
+  tick* — one line per transit path, per cold-probe leg, per dampener-suppressed
+  neighbor — which on a live host measured ~5.6 lines/s of mostly-unchanged
+  text, burying the events that matter. Now: a single summary line per tick
+  whenever any counter changed, plus a 30 s heartbeat, carrying
+  scope/underlay/transit/ema/new-retransmits/legs/decisions/updates/actuations/
+  suppressions/skip-reasons/drops; new retransmits log on their *delta* rather
+  than their standing count; persistent conditions (dampener suppression,
+  no-confidence) are edge-triggered; repeating per-path errors warn once per
+  key; per-item detail moved behind `--verbose`. Steady-state output drops by
+  ~2 orders of magnitude while each line carries strictly more information —
+  `formatTickSummary`/`emitTickSummary` are unit-tested for the field set and
+  for the change-only+heartbeat rule.
+
 ## v0.0.4
 
 - **Route-map actuation is now an in-place, deletion-free rewrite.** Deleting a

@@ -3,6 +3,22 @@
 // pathprofiler-daemon: userspace control loop for the hybrid dual-plane
 // path profiler. Polls the BPF maps, deltas the raw counters, scores each
 // candidate next-hop, and actuates via FRR route-maps with hysteresis.
+// Logging contract (kept deliberately dense):
+//
+//   - ONE summary line per tick carries every counter the loop observed
+//     ("tick N: scope=p/p underlay=i transit=n ..."). It is the heartbeat and
+//     the first thing to read.
+//   - Events log on their own, once: new retransmits (delta, not standing
+//     count), actuations, removals, probe decisions, failures, tripwires.
+//     Conditions that persist (dampener suppression, no-confidence) are
+//     edge-triggered -- logged when they start or when their breakdown
+//     changes, never once per tick.
+//   - Per-path and per-leg detail is behind --verbose.
+//
+// Rationale: the previous shape logged per-item-per-tick (one line per
+// transit path, per cold-probe leg, per suppressed neighbor), which on a real
+// host was ~5.6 lines/s of mostly-unchanged content and buried the events
+// that actually change.
 package main
 
 import (
@@ -24,6 +40,70 @@ import (
 	"pathprofiler/internal/ospf"
 	"pathprofiler/internal/score"
 )
+
+// summaryHeartbeatTicks is how often the tick summary is emitted even when
+// nothing changed: at the default 2s poll that is a 30s heartbeat.
+const summaryHeartbeatTicks = 15
+
+// tickCounters is everything the control loop observed in one tick. It is
+// rendered as a single summary line (see the logging contract in the file
+// header), so the fields here ARE the log format: adding a counter means
+// adding it here and in formatTickSummary, which TestFormatTickSummary_Keys
+// pins down.
+type tickCounters struct {
+	Tick            uint64
+	Prefixes        int
+	Paths           int
+	UnderlayIfaces  int
+	TransitEntries  int
+	EMAPaths        int
+	NewRetransmits  int
+	ProbeLegs       int
+	Better          int
+	Worse           int
+	Indifferent     int
+	Updates         int
+	Applied         int
+	Suppressed      int
+	SkippedZeroWin  int
+	SkippedNoPrefix int
+	SkippedAmbigNH  int
+	SkippedNoCold   int
+	Dropped         uint64
+}
+
+// formatTickSummary renders the dense single-line tick summary.
+func formatTickSummary(c tickCounters) string {
+	return fmt.Sprintf(
+		"scope=%dpfx/%dpaths underlay=%dif transit=%d ema=%d retrans=%d legs=%d decided=%d/%d/%d updates=%d applied=%d suppressed=%d skip=%d/%d/%d/%d dropped=%d",
+		c.Prefixes, c.Paths, c.UnderlayIfaces, c.TransitEntries, c.EMAPaths, c.NewRetransmits,
+		c.ProbeLegs, c.Better, c.Worse, c.Indifferent, c.Updates, c.Applied, c.Suppressed,
+		c.SkippedZeroWin, c.SkippedNoPrefix, c.SkippedAmbigNH, c.SkippedNoCold, c.Dropped)
+}
+
+// emitTickSummary logs the tick summary when its content changed, or when the
+// heartbeat interval elapsed. Repeating an identical line every poll would be
+// noise; a heartbeat keeps a stalled-but-unchanged loop visible.
+func emitTickSummary(prevBody *string, lastEmitTick *uint64, c tickCounters) {
+	body := formatTickSummary(c)
+	if body == *prevBody && c.Tick-*lastEmitTick < summaryHeartbeatTicks {
+		return
+	}
+	*prevBody = body
+	*lastEmitTick = c.Tick
+	log.Printf("tick %d: %s", c.Tick, body)
+}
+
+// warnOnce logs a repeating condition at most once per key. A per-tick error
+// about the same path/gateway is a condition, not an event; its ongoing
+// presence stays visible through the tick summary's skip counters.
+func warnOnce(seen map[string]bool, key, format string, args ...any) {
+	if seen[key] {
+		return
+	}
+	seen[key] = true
+	log.Printf(format, args...)
+}
 
 func main() {
 	pollInterval := flag.Duration("poll", 2*time.Second, "map polling interval")
@@ -159,6 +239,15 @@ func main() {
 	attachedTCSet := []string{}  // interfaces TC is attached to, for change-only logging
 	firstTopoRefresh := true     // tripwire: log dst_to_nexthop count after first populate
 
+	// Logging state for the dense-summary/edge-triggered-events contract
+	// documented in the file header.
+	var tickNo uint64
+	suppressedNeighbors := make(map[string]bool) // dampener-suppressed, for edge-triggered logs
+	prevNoConfidence := ""                       // breakdown of the last no-confidence warning
+	prevSummaryBody := ""                        // last emitted tick-summary body (change-only)
+	var lastSummaryTick uint64                   // tick of the last emitted summary (heartbeat)
+	warnedKeys := make(map[string]bool)          // condition keys already warned about (warnOnce)
+
 	// appliedActiveComposite/appliedActiveNeighbor mirror, per prefix, the
 	// neighbor last confirmed to hold top tier (cfg.Tiers.Local) in FRR's
 	// live route-maps -- confirmed meaning a dampener-allowed, successfully
@@ -182,6 +271,11 @@ func main() {
 	defer ticker.Stop()
 
 	for range ticker.C {
+		tickNo++
+		// Per-tick counters, all folded into the single summary line emitted
+		// at the end of the tick (see the file header's logging contract).
+		var tickTransitRetrans, tickLegs, tickBetter, tickWorse, tickIndifferent, tickApplied, tickSuppressed int
+
 		// --- 1. Topology refresh (slow cadence) ---
 		if time.Since(lastTopoFetch) >= probeInterval {
 			rib, err := bgp.FetchRIB()
@@ -272,7 +366,6 @@ func main() {
 		}
 		transitEMA.Update(time.Now(), *pollInterval, transitDeltas)
 		emaSnapshot := transitEMA.Snapshot()
-		log.Printf("transit map: %d entries, ema snapshot: %d paths", len(transitNow), len(emaSnapshot))
 		prevTransit = transitNow
 
 		// Tripwire: if dst_to_nexthop misses are dropping everything.
@@ -300,14 +393,18 @@ func main() {
 			}
 		}
 
-		// Log transit debug counters for dst_to_nexthop misses.
-		if len(transitNow) > 0 {
-			for pk, st := range transitNow {
-				if st.Retransmits > 0 {
-					log.Printf("transit raw: nh=%s dst_subnet=%s seg=%d retrans=%d",
-						uint32ToIPStr(pk.NextHopIP), uint32ToIPStr(pk.DstSubnet),
-						st.Segments, st.Retransmits)
-				}
+		// Retransmits are the tool's core signal, but a standing counter is
+		// steady state, not news. Log only when NEW retransmits were delta'd
+		// this tick; the standing count stays visible under --verbose.
+		for pk, st := range transitNow {
+			if d := transitDeltas[pk].Retransmits; d > 0 {
+				tickTransitRetrans++
+				log.Printf("transit retrans: nh=%s dst=%s +%d (total=%d seg=%d)",
+					uint32ToIPStr(pk.NextHopIP), uint32ToIPStr(pk.DstSubnet), d, st.Retransmits, st.Segments)
+			} else if *verbose && st.Retransmits > 0 {
+				log.Printf("[verbose] transit raw: nh=%s dst_subnet=%s seg=%d retrans=%d",
+					uint32ToIPStr(pk.NextHopIP), uint32ToIPStr(pk.DstSubnet),
+					st.Segments, st.Retransmits)
 			}
 		}
 
@@ -321,13 +418,6 @@ func main() {
 		// compare against.
 
 		coldByPrefix := make(map[string][]score.PathCost)
-		{
-			totalPaths := 0
-			for _, pp := range inScope {
-				totalPaths += len(pp)
-			}
-			log.Printf("cold probe: scanning %d prefixes, %d BGP paths", len(inScope), totalPaths)
-		}
 		for prefix, paths := range inScope {
 			activeComposite, hasBaseline := appliedActiveComposite[prefix]
 			activeNeighbor := appliedActiveNeighbor[prefix]
@@ -337,7 +427,8 @@ func main() {
 			for _, p := range paths {
 				physPaths, rpErr := netutil.ResolvePaths(p.NextHop, cachedUnderlay)
 				if rpErr != nil {
-					log.Printf("probe %s (neighbor %s, prefix %s): resolve paths: %v", p.NextHop, p.Neighbor, prefix, rpErr)
+					warnOnce(warnedKeys, "resolve:"+p.NextHop+":"+prefix,
+						"probe %s (neighbor %s, prefix %s): resolve paths: %v", p.NextHop, p.Neighbor, prefix, rpErr)
 				}
 				for _, pp := range physPaths {
 					if *verbose {
@@ -355,18 +446,33 @@ func main() {
 						probeTimeoutMultiplier, probeMinTimeout, activeComposite,
 						adaptiveDelta, adaptiveAlpha, adaptiveBeta, score.DefaultWeights.EgressLoss)
 					if err != nil {
-						log.Printf("probe %s via %s: %v", p.NextHop, pp.Interface, err)
+						warnOnce(warnedKeys, "probe:"+p.NextHop+":"+pp.Interface,
+							"probe %s via %s: %v", p.NextHop, pp.Interface, err)
 						continue
 					}
 					synthetic := score.FromProbeResult(ipStrToUint32(p.NextHop), r.RTT, r.LossRate, r.LossRateErr)
 					synthetic.Neighbor = p.Neighbor
 					coldByPrefix[prefix] = append(coldByPrefix[prefix], synthetic)
-					baselineStr := "none (no active path for this prefix yet)"
-					if hasBaseline {
-						baselineStr = fmt.Sprintf("%.0f vs active neighbor %s", activeComposite, activeNeighbor)
+					tickLegs++
+					switch outcome {
+					case actuate.OutcomeBetter:
+						tickBetter++
+					case actuate.OutcomeWorse:
+						tickWorse++
+					case actuate.OutcomeIndifferent:
+						tickIndifferent++
 					}
-					log.Printf("cold probe %s via %s (iface %s): rtt=%v lossRate=%.2f err=±%.3f probes=%d/%d (cumulative) outcome=%s baseline=%s",
-						p.Neighbor, p.NextHop, pp.Interface, r.RTT, r.LossRate, r.LossRateErr, r.ProbeCount, adaptiveMaxN, outcome, baselineStr)
+					// A leg that reaches a decision is an event; one still
+					// accumulating evidence is steady state (its counts ride in
+					// the tick summary) and is otherwise --verbose.
+					if *verbose || outcome != actuate.OutcomeUndecided {
+						baselineStr := "none (no active path for this prefix yet)"
+						if hasBaseline {
+							baselineStr = fmt.Sprintf("%.0f vs active neighbor %s", activeComposite, activeNeighbor)
+						}
+						log.Printf("cold probe %s via %s (iface %s): rtt=%v lossRate=%.2f±%.3f probes=%d/%d outcome=%s baseline=%s",
+							p.Neighbor, p.NextHop, pp.Interface, r.RTT, r.LossRate, r.LossRateErr, r.ProbeCount, adaptiveMaxN, outcome, baselineStr)
+					}
 				}
 			}
 		}
@@ -396,16 +502,17 @@ func main() {
 			nhToMatch := pk.NextHopIP
 			if cachedUnderlay != nil {
 				if lb, err := cachedUnderlay.LoopbackForGateway(nextHopStr); err != nil {
-					log.Printf("transit override: ambiguous NH %s: %v — skipping", nextHopStr, err)
+					warnOnce(warnedKeys, "ambig:"+nextHopStr,
+						"transit override: ambiguous NH %s: %v — skipping", nextHopStr, err)
 					skippedAmbiguousNH++
 					continue
 				} else if lb != "" {
 					nhToMatch = ipStrToUint32(lb)
 				}
 			}
-			if !transitSeen[logKey] {
+			if *verbose && !transitSeen[logKey] {
 				transitSeen[logKey] = true
-				log.Printf("transit nexthop=%s prefix=%s seg=%d ema_loss=%.4f err=±%.4f",
+				log.Printf("[verbose] transit nexthop=%s prefix=%s seg=%d ema_loss=%.4f err=±%.4f",
 					nextHopStr, prefix, ema.WindowSegments, ema.EMALossRate, ema.EMALossRateErr)
 			}
 			matched := false
@@ -440,10 +547,18 @@ func main() {
 			}
 		}
 		if len(coldByPrefix) > 0 && !hasConfidence {
-			log.Printf("transit override: NO cold-probe entry has Confidence>0 — "+
-				"transit data may not be flowing (check TC attachment) "+
-				"[ema_paths=%d zeroWindow=%d noPrefix=%d ambiguousNH=%d noColdMatch=%d]",
+			// Persistent condition: log when it starts, or when the skip-reason
+			// breakdown changes -- not once per tick.
+			breakdown := fmt.Sprintf("ema_paths=%d zeroWindow=%d noPrefix=%d ambiguousNH=%d noColdMatch=%d",
 				len(emaSnapshot), skippedZeroWindow, skippedNoPrefix, skippedAmbiguousNH, skippedNoColdMatch)
+			if breakdown != prevNoConfidence {
+				prevNoConfidence = breakdown
+				log.Printf("transit override: NO cold-probe entry has Confidence>0 — "+
+					"transit data may not be flowing (check TC attachment) [%s]", breakdown)
+			}
+		} else if prevNoConfidence != "" {
+			log.Printf("transit override: cold-probe confidence restored [was %s]", prevNoConfidence)
+			prevNoConfidence = ""
 		}
 
 		// --- 6. Rank per prefix -> group by neighbor ---
@@ -473,14 +588,22 @@ func main() {
 		for _, u := range updates {
 			thisTickNeighbors[u.Neighbor] = true
 			if !dampener.Allow(u.Neighbor) {
-				log.Printf("neighbor %s: tier change suppressed by dampener", u.Neighbor)
+				tickSuppressed++
+				if !suppressedNeighbors[u.Neighbor] {
+					// The suppression persists for --min-dwell, so log it when
+					// it starts rather than on every tick it holds.
+					suppressedNeighbors[u.Neighbor] = true
+					log.Printf("neighbor %s: tier change suppressed by dampener (holding last applied change)", u.Neighbor)
+				}
 				continue
 			}
+			delete(suppressedNeighbors, u.Neighbor)
 			if err := actuate.SetNeighborTiers(u); err != nil {
 				log.Printf("neighbor %s: set tiers failed: %v", u.Neighbor, err)
 				continue
 			}
 			dampener.Record(u.Neighbor)
+			tickApplied++
 			log.Printf("neighbor %s: applied %d prefix tiers", u.Neighbor, len(u.Prefs))
 
 			syncAppliedActiveMirror(appliedActiveNeighbor, appliedActiveComposite,
@@ -498,6 +621,37 @@ func main() {
 			}
 		}
 		appliedNeighbors = thisTickNeighbors
+
+		// --- 9. Tick summary (one dense line; see the logging contract) ---
+		totalPaths := 0
+		for _, pp := range inScope {
+			totalPaths += len(pp)
+		}
+		ddVal := uint64(0)
+		if dd, ddErr := reader.DebugDropped(); ddErr == nil {
+			ddVal = dd
+		}
+		emitTickSummary(&prevSummaryBody, &lastSummaryTick, tickCounters{
+			Tick:            tickNo,
+			Prefixes:        len(inScope),
+			Paths:           totalPaths,
+			UnderlayIfaces:  len(cachedUnderlay),
+			TransitEntries:  len(transitNow),
+			EMAPaths:        len(emaSnapshot),
+			NewRetransmits:  tickTransitRetrans,
+			ProbeLegs:       tickLegs,
+			Better:          tickBetter,
+			Worse:           tickWorse,
+			Indifferent:     tickIndifferent,
+			Updates:         len(updates),
+			Applied:         tickApplied,
+			Suppressed:      tickSuppressed,
+			SkippedZeroWin:  skippedZeroWindow,
+			SkippedNoPrefix: skippedNoPrefix,
+			SkippedAmbigNH:  skippedAmbiguousNH,
+			SkippedNoCold:   skippedNoColdMatch,
+			Dropped:         ddVal,
+		})
 	}
 }
 

@@ -3,7 +3,11 @@
 package main
 
 import (
+	"bytes"
+	"log"
 	"net"
+	"os"
+	"strings"
 	"testing"
 
 	"pathprofiler/internal/actuate"
@@ -124,5 +128,72 @@ func TestSyncAppliedActiveMirror_OtherNeighborLeavesMirrorUntouched(t *testing.T
 	}
 	if activeComposite["192.168.5.0/24"] != 4200 {
 		t.Errorf("want active composite to remain 4200, got %v", activeComposite["192.168.5.0/24"])
+	}
+}
+
+// TestFormatTickSummary_HasEveryKey pins the summary's field set: the summary
+// is the daemon's primary observability line, so a counter silently dropped
+// from it is a regression.
+func TestFormatTickSummary_HasEveryKey(t *testing.T) {
+	got := formatTickSummary(tickCounters{})
+	for _, key := range []string{
+		"scope=", "underlay=", "transit=", "ema=", "retrans=", "legs=",
+		"decided=", "updates=", "applied=", "suppressed=", "skip=", "dropped=",
+	} {
+		if !strings.Contains(got, key) {
+			t.Errorf("tick summary is missing %q: %s", key, got)
+		}
+	}
+}
+
+// TestEmitTickSummary_ChangeOnlyWithHeartbeat is the density contract: an
+// unchanged tick must not log (that is the verbosity this replaced), a changed
+// tick must log immediately, and a quiet loop still emits a heartbeat so a
+// stalled daemon is visible.
+func TestEmitTickSummary_ChangeOnlyWithHeartbeat(t *testing.T) {
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	defer log.SetOutput(os.Stderr)
+
+	countLines := func() int { return strings.Count(buf.String(), "tick ") }
+
+	var prevBody string
+	var lastEmitTick uint64
+	base := tickCounters{Tick: 1, Prefixes: 2, Paths: 2, UnderlayIfaces: 1, ProbeLegs: 2}
+
+	emitTickSummary(&prevBody, &lastEmitTick, base)
+	if n := countLines(); n != 1 {
+		t.Fatalf("first tick must emit, got %d line(s): %s", n, buf.String())
+	}
+
+	// Identical counters: silent up to (not including) the heartbeat.
+	for tick := uint64(2); tick <= summaryHeartbeatTicks; tick++ {
+		c := base
+		c.Tick = tick
+		emitTickSummary(&prevBody, &lastEmitTick, c)
+	}
+	if n := countLines(); n != 1 {
+		t.Errorf("unchanged ticks 2..%d must stay silent, got %d line(s): %s",
+			summaryHeartbeatTicks, n, buf.String())
+	}
+
+	// Heartbeat.
+	c := base
+	c.Tick = summaryHeartbeatTicks + 1
+	emitTickSummary(&prevBody, &lastEmitTick, c)
+	if n := countLines(); n != 2 {
+		t.Errorf("tick %d should heartbeat, got %d line(s): %s", c.Tick, n, buf.String())
+	}
+
+	// Any changed counter emits immediately.
+	c = base
+	c.Tick = summaryHeartbeatTicks + 2
+	c.NewRetransmits = 3
+	emitTickSummary(&prevBody, &lastEmitTick, c)
+	if n := countLines(); n != 3 {
+		t.Errorf("changed counters must emit, got %d line(s): %s", n, buf.String())
+	}
+	if !strings.Contains(buf.String(), "retrans=3") {
+		t.Errorf("changed value missing from output: %s", buf.String())
 	}
 }
