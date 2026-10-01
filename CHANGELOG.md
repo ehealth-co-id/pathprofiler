@@ -1,5 +1,53 @@
 # Changelog
 
+## v0.0.4
+
+- **Route-map actuation is now an in-place, deletion-free rewrite.** Deleting a
+  per-neighbor route-map and re-adding it while the neighbor's `route-map ... in`
+  binding was still live is a use-after-free on FRR builds before 10.2.4
+  (upstream #19191, "Do not try to reuse freed route-maps"): the delete frees
+  the map, the peer's inbound filter keeps pointing at it, and the next inbound
+  UPDATE runs `route_map_apply_ext` against freed memory — a `SIGSEGV` reached
+  from `bgp_update`/`bgp_nlri_parse_ip`. In the e/f deployment this killed bgpd
+  roughly every ten minutes for as long as pathprofiler ran. `SetNeighborTiers`
+  now deletes nothing: each route-map has a fixed, grow-only set of sequence
+  "slots" that are rewritten in place every tick. A slot with a prefix carries
+  that prefix's `PATHPROFILER-SCOPE-*` match and local-preference; an
+  unassigned slot matches `PATHPROFILER-NEVER` (`192.0.2.1/32`, RFC 5737) so it
+  is inert and evaluation falls through to the next sequence; a shrinking
+  prefix set turns trailing slots inert instead of deleting them. Re-declaring
+  a sequence replaces its match/set clauses (verified against FRR 10.2.3 and
+  10.6.2), so FRR ends every tick exactly at that tick's decision.
+  In-place was chosen over "detach, then delete, then re-add" on measurements,
+  not style: with two paths per prefix, 60 detach/delete/re-add rewrites moved
+  the BGP table version by 440 while 60 in-place rewrites moved it by 0 — and
+  the destructive rewrite is what crashes the older builds. `assertInPlaceRewrite`
+  asserts the emitted script contains no `no route-map` and no detach.
+
+- **Startup normalization and prefix-list garbage collection.**
+  `actuate.NormalizeApplied` runs once at daemon start and removes every
+  `PATHPROFILER-*` route-map (bound *and* orphaned) and prefix-list, so the
+  in-place rewrite always starts from a clean slate instead of inheriting
+  sequences from an older layout that it would never touch. Its ordering
+  mirrors the removal path — detach every binding, then delete the maps under
+  the name actually found in the config (not one re-derived from the neighbor
+  address, which left a legacy-named map bound and undeleted), then delete the
+  prefix-lists last — so nothing is deleted while it is still referenced or
+  bound. This also collects the `PATHPROFILER-SCOPE-*` lists that the previous
+  clear-then-re-add strategy leaked permanently.
+
+- **Attach XDP/TC on every topology refresh, not once.** The main loop latched
+  `xdpRetried`/`tcAttached` on the first refresh with a non-empty OSPF
+  underlay and never attached again. An interface that appeared later — a leg
+  whose OSPF adjacency was down at that first refresh, or came up afterwards —
+  therefore never got `transit_egress`. Its forwarded traffic was never
+  measured, so its cold-probe entries could never reach `Confidence>0` and
+  `RankByTier`'s promotion gate never opened for it (this is what left `eth3`
+  without a transit hook on `e`). `AttachXDP`/`AttachTC` are already
+  idempotent (they skip interfaces already attached), so the loop now calls
+  them against the current underlay each refresh; stale-TC cleanup still runs
+  exactly once, before the first attach.
+
 ## v0.0.3
 
 - **Dampener-gated cold-probe SPRT reference.** Fixed the SPRT `outcome` for

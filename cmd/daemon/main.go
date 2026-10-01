@@ -134,14 +134,20 @@ func main() {
 	// possible with FRR's one-route-map-per-neighbor-per-direction model.
 	dampener := actuate.NewDampener(*minDwell)
 
-	// F3: bootstrap appliedNeighbors from FRR's actual state, not empty.
-	// Without this, a daemon restart orphans every route-map the prior
-	// process applied, and Drained -> Absent cleanup silently stops working.
-	appliedNeighbors, err := actuate.ListAppliedNeighbors()
-	if err != nil {
-		log.Printf("bootstrap applied neighbors (non-fatal): %v", err)
-		appliedNeighbors = make(map[string]bool)
+	// Startup normalization: remove every route-map/prefix-list a prior process
+	// left in FRR, so the in-place slot rewrite (actuate.SetNeighborTiers, which
+	// never deletes while a binding is live) starts from a clean slate and can't
+	// inherit stale sequences from an older layout. It also garbage-collects the
+	// PATHPROFILER-SCOPE-* prefix-lists the previous clear-then-re-add strategy
+	// leaked. Because it removes everything, the applied-neighbor set genuinely
+	// starts empty -- there is no prior state left for the Drained -> Absent
+	// cleanup to inherit.
+	if n, err := actuate.NormalizeApplied(); err != nil {
+		log.Printf("startup normalize (non-fatal): %v", err)
+	} else if n > 0 {
+		log.Printf("startup normalize: detached and removed %d prior route-map binding(s)", n)
 	}
+	appliedNeighbors := make(map[string]bool)
 
 	prevTransit := make(map[maps.PathKey]maps.TransitStats)
 	transitEMA := metrics.NewEMAStore(10*time.Second, *transitEMAHalfLife)
@@ -149,9 +155,8 @@ func main() {
 	var cachedRIB map[string][]bgp.Path
 	var cachedUnderlay ospf.Underlay
 	lastTopoFetch := time.Time{} // zero forces first fetch
-	xdpRetried := false          // track whether we've retried XDP after startup
-	tcAttached := false          // track whether TC egress programs have been attached
-	tcDoneStaleCleanup := false  // track whether stale TC detach ran on first topo refresh
+	tcDoneStaleCleanup := false  // stale TC detach runs once, before the first attach
+	attachedTCSet := []string{}  // interfaces TC is attached to, for change-only logging
 	firstTopoRefresh := true     // tripwire: log dst_to_nexthop count after first populate
 
 	// appliedActiveComposite/appliedActiveNeighbor mirror, per prefix, the
@@ -194,31 +199,37 @@ func main() {
 			}
 			lastTopoFetch = time.Now()
 
-			// --- Retry XDP attachment once underlay is available ---
-			if !xdpRetried && len(cachedUnderlay) > 0 {
-				xdpRetried = true
-				ifaces := ifacesFromUnderlay(cachedUnderlay)
-				if len(ifaces) > 0 {
+			// --- Attach XDP + TC on every topo refresh (both idempotent) ---
+			//
+			// These were one-shot latches (xdpRetried/tcAttached): the attach
+			// happened on the first refresh with a non-empty underlay and never
+			// again. An interface that appeared later -- a leg whose OSPF
+			// adjacency was down at that first refresh, or came up afterwards --
+			// therefore never got transit_egress attached. Its forwarded traffic
+			// was never measured, so its cold-probe entries could never reach
+			// Confidence>0 and RankByTier's promotion gate never opened for it:
+			// the interface silently stays unmonitored. AttachXDP and AttachTC
+			// both skip interfaces already attached, so re-running against the
+			// current underlay only adds what is newly present.
+			if len(cachedUnderlay) > 0 {
+				// Stale TC programs from prior daemon runs are removed once,
+				// before the first attach. Never re-run: it would also detach
+				// our own programs.
+				if !tcDoneStaleCleanup {
+					tcDoneStaleCleanup = true
+					loader.DetachStaleTC(uniqueTcIfaces(cachedUnderlay))
+				}
+
+				if ifaces := ifacesFromUnderlay(cachedUnderlay); len(ifaces) > 0 {
 					bpfLoader.AttachXDP(ifaces)
 				}
-			}
 
-			// --- Detach stale TC programs from prior runs before first attach ---
-			if !tcDoneStaleCleanup && len(cachedUnderlay) > 0 {
-				tcDoneStaleCleanup = true
-				tcIfaces := uniqueTcIfaces(cachedUnderlay)
-				loader.DetachStaleTC(tcIfaces)
-			}
-
-			// --- Retry TC attach once underlay is available ---
-			if !tcAttached && len(cachedUnderlay) > 0 {
 				tcIfaces := uniqueTcIfaces(cachedUnderlay)
 				if len(tcIfaces) > 0 {
 					if err := bpfLoader.AttachTC(tcIfaces); err != nil {
 						log.Printf("TC attach (retrying next tick): %v", err)
-						// Do NOT set tcAttached=true here — failure must retry.
-					} else {
-						tcAttached = true
+					} else if !sameStringSet(tcIfaces, attachedTCSet) {
+						attachedTCSet = tcIfaces
 						log.Printf("TC attached to %d interfaces: %v", len(tcIfaces), tcIfaces)
 					}
 				}
@@ -626,6 +637,27 @@ func diff(cur, prev uint64) uint64 {
 		return 0 // counter reset (LRU eviction/reload) -- treat as no delta this tick, not negative
 	}
 	return cur - prev
+}
+
+// sameStringSet reports whether a and b hold the same elements, ignoring
+// order (uniqueTcIfaces and ifacesFromUnderlay both walk maps, so their
+// output order is not stable). Used to log the attached-interface set only
+// when it actually changes.
+func sameStringSet(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	counts := make(map[string]int, len(a))
+	for _, s := range a {
+		counts[s]++
+	}
+	for _, s := range b {
+		counts[s]--
+		if counts[s] < 0 {
+			return false
+		}
+	}
+	return true
 }
 
 // syncAppliedActiveMirror updates appliedActiveNeighbor/appliedActiveComposite
